@@ -140,6 +140,18 @@ func cookiesFromBrowser() (map[string]string, error) {
 	return nil, fmt.Errorf("missing required cookie(s): %s%s", strings.Join(missing, ", "), hint)
 }
 
+// pairRequest builds the pairing request. The daemon refuses any request from
+// a client that has not identified itself (see wire.SafeClient), so the CLI
+// must send the marker like the panel does.
+func pairRequest(cookies map[string]string) wire.Request {
+	return wire.Request{
+		ID:     "pair",
+		Method: wire.MethodGaiaPairing,
+		Params: wire.GaiaPairingParams{Cookies: cookies},
+		Client: wire.SafeClient,
+	}
+}
+
 // submitCookies hands a validated cookie set to the running daemon and follows
 // the pairing exchange to completion.
 func submitCookies(cookies map[string]string) error {
@@ -159,11 +171,7 @@ func submitCookies(cookies map[string]string) error {
 	}
 	defer conn.Close()
 
-	req := wire.Request{
-		ID:     "pair",
-		Method: wire.MethodGaiaPairing,
-		Params: wire.GaiaPairingParams{Cookies: cookies},
-	}
+	req := pairRequest(cookies)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("send pairing request: %w", err)
 	}
