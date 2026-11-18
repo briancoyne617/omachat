@@ -17,6 +17,9 @@ type creationContacts struct{ waStore.ContactStore }
 func (creationContacts) GetAllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
 	return map[types.JID]types.ContactInfo{types.NewJID("15550002222", types.DefaultUserServer): {FullName: "Taylor"}}, nil
 }
+func (creationContacts) GetContact(context.Context, types.JID) (types.ContactInfo, error) {
+	return types.ContactInfo{}, nil
+}
 func TestCreateConversationReopensWithoutReplacingActivity(t *testing.T) {
 	b, mock, _ := setupTestBackend(t)
 	b.SetClient(mock, true)

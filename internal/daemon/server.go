@@ -346,7 +346,7 @@ func (d *Daemon) dispatchSignal(ctx context.Context, req wire.Request) wire.Resp
 		if err != nil {
 			return fail(err)
 		}
-		return ok(d.sg.Conversations(p.Count))
+		return ok(decorateServiceList(wire.NetworkSignal, d.sg.Conversations(p.Count)))
 	case wire.MethodConversationTargets:
 		res, err := d.sg.ConversationTargets(ctx)
 		if err != nil {
@@ -466,7 +466,7 @@ func (d *Daemon) dispatchMessenger(ctx context.Context, req wire.Request) wire.R
 		if err != nil {
 			return fail(err)
 		}
-		return ok(d.fb.Conversations(p.Count))
+		return ok(decorateServiceList(wire.NetworkMessenger, d.fb.Conversations(p.Count)))
 	case wire.MethodConversationTargets:
 		res, err := d.fb.ConversationTargets(ctx)
 		if err != nil {
@@ -1044,7 +1044,7 @@ func (d *Daemon) dispatchTelegram(ctx context.Context, req wire.Request) wire.Re
 		if err != nil {
 			return fail(err)
 		}
-		return ok(d.tg.Conversations(p.Count))
+		return ok(decorateServiceList(wire.NetworkTelegram, d.tg.Conversations(p.Count)))
 
 	case wire.MethodConversationTargets:
 		res, err := d.tg.ConversationTargets(ctx)

@@ -31,6 +31,14 @@ func initials(name string) string {
 	return string(out)
 }
 
+// participantNumber prefers the formatted number and falls back to the raw one.
+func participantNumber(p *gmproto.Participant) string {
+	if n := p.GetFormattedNumber(); n != "" {
+		return n
+	}
+	return p.GetID().GetNumber()
+}
+
 func convParticipants(conv *gmproto.Conversation) []wire.Participant {
 	src := conv.GetParticipants()
 	if len(src) == 0 {
@@ -48,7 +56,7 @@ func convParticipants(conv *gmproto.Conversation) []wire.Participant {
 		out = append(out, wire.Participant{
 			ID:          p.GetID().GetParticipantID(),
 			Name:        name,
-			Number:      p.GetFormattedNumber(),
+			Number:      participantNumber(p),
 			IsMe:        p.GetIsMe(),
 			AvatarColor: p.GetAvatarHexColor(),
 			Initials:    initials(name),
@@ -70,6 +78,7 @@ func convertConversation(conv *gmproto.Conversation) wire.Conversation {
 		}
 	}
 	latest := conv.GetLatestMessage()
+	parts := convParticipants(conv)
 	return wire.Conversation{
 		ID:           conv.GetConversationID(),
 		Name:         name,
@@ -83,7 +92,10 @@ func convertConversation(conv *gmproto.Conversation) wire.Conversation {
 		AvatarColor:  conv.GetAvatarHexColor(),
 		Initials:     initials(name),
 		OutgoingID:   conv.GetDefaultOutgoingID(),
-		Participants: convParticipants(conv),
+		Participants: parts,
+		Kind:         conversationKind(conv.GetType()),
+		Contact:      hasSavedContact(conv),
+		Known:        hasSavedContact(conv),
 	}
 }
 

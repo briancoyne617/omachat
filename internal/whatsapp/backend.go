@@ -73,6 +73,8 @@ type Backend struct {
 	historyAnchors       map[hotHistoryAnchorKey]hotHistoryAnchor
 	historyAnchorOrder   []hotHistoryAnchorKey
 	device               *waStore.Device
+	contactMu            sync.Mutex
+	contactCache         map[string]contactAnswer
 	client               Client
 	paired               bool
 	status               wire.Status
@@ -454,6 +456,9 @@ func lookupContactName(ctx context.Context, device *waStore.Device, jid types.JI
 }
 
 func (b *Backend) refreshConversationNames(device *waStore.Device) {
+	b.contactMu.Lock()
+	clear(b.contactCache)
+	b.contactMu.Unlock()
 	b.mu.RLock()
 	gen := b.gen
 	ids := append([]string(nil), b.order...)
@@ -962,7 +967,7 @@ func (b *Backend) Conversations(count int) []wire.Conversation {
 		if len(b.messages[id]) == 0 && b.convs[id].Timestamp == 0 {
 			continue
 		}
-		out = append(out, b.convs[id])
+		out = append(out, b.decorateLocked(b.convs[id]))
 	}
 	return out
 }
@@ -2410,6 +2415,11 @@ func (b *Backend) emit(evtType string, payload any) {
 	if b.publish == nil {
 		return
 	}
+	if conv, ok := payload.(wire.Conversation); ok {
+		b.mu.RLock()
+		payload = b.decorateLocked(conv)
+		b.mu.RUnlock()
+	}
 	b.publish(wire.Event{
 		Network: wire.NetworkWhatsApp,
 		Event:   evtType,
@@ -2425,6 +2435,9 @@ func (b *Backend) emit(evtType string, payload any) {
 func (b *Backend) emitLocked(evtType string, payload any) {
 	if b.publish == nil {
 		return
+	}
+	if conv, ok := payload.(wire.Conversation); ok {
+		payload = b.decorateLocked(conv)
 	}
 	b.publish(wire.Event{
 		Network: wire.NetworkWhatsApp,

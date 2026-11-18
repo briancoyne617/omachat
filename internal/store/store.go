@@ -75,6 +75,10 @@ func (p *Paths) SessionFile() string { return filepath.Join(p.Data, "session.jso
 // WhatsAppDBFile is where the SQLite database for WhatsApp session is stored.
 func (p *Paths) WhatsAppDBFile() string { return filepath.Join(p.Data, "whatsapp.db") }
 
+// GMessagesSentFile remembers which Google Messages threads the user has
+// replied in, so a thread from an unsaved number can be listed as a person.
+func (p *Paths) GMessagesSentFile() string { return filepath.Join(p.Data, "gmessages_sent.json") }
+
 // SocketPath is where the plugin connects.
 func (p *Paths) SocketPath() string { return filepath.Join(p.Runtime, "daemon.sock") }
 
@@ -155,6 +159,9 @@ func (p *Paths) ClearSession() error {
 	p.sessionMu.Lock()
 	defer p.sessionMu.Unlock()
 	if err := os.Remove(p.SessionFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(p.GMessagesSentFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := os.RemoveAll(p.MediaDir()); err != nil {

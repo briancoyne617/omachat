@@ -56,6 +56,7 @@ type Daemon struct {
 	selfIDs map[string]bool
 
 	media         *mediaCache
+	promo         *promotionStore
 	avatars       *avatarStore
 	previews      *previewCache
 	config        *store.ConfigStore
@@ -110,6 +111,7 @@ func New(log zerolog.Logger, paths *store.Paths) *Daemon {
 		selfIDs:   make(map[string]bool),
 		subs:      make(map[chan wire.Event]struct{}),
 		media:     newMediaCache(paths.MediaDir()),
+		promo:     newPromotionStore(paths.GMessagesSentFile()),
 		avatars:   newAvatarStore(paths.MediaDir()),
 		previews:  newPreviewCache(paths),
 		config:    store.NewConfigStore(paths.ConfigFile()),
@@ -383,6 +385,7 @@ func (d *Daemon) Subscribe() (<-chan wire.Event, func()) {
 
 // PublishEvent pushes an event to all connected subscribers.
 func (d *Daemon) PublishEvent(evt wire.Event) {
+	evt = decorateServiceEvent(evt)
 	d.subMu.Lock()
 	defer d.subMu.Unlock()
 	for ch := range d.subs {
@@ -584,6 +587,10 @@ func (d *Daemon) touchConversation(m wire.Message) {
 	if m.Timestamp >= conv.Timestamp {
 		conv.Timestamp = m.Timestamp
 		conv.PreviewMine = m.FromMe
+		if m.FromMe && d.promo != nil && !conv.Known && !isShortCodeConversation(conv.Participants, conv.IsGroup) {
+			d.promo.markSent(conv.ID)
+			conv.Known = true
+		}
 		if m.Text != "" {
 			conv.Preview = m.Text
 		} else if len(m.Attachments) > 0 {
@@ -606,6 +613,7 @@ func (d *Daemon) replaceConversations(convs []*gmproto.Conversation) {
 	d.convs = make(map[string]wire.Conversation, len(convs))
 	for _, c := range convs {
 		w := convertConversation(c)
+		d.applyPromotion(&w)
 		if p, ok := d.avatars.cached(w.ID); ok {
 			w.AvatarPath = p
 		}
@@ -625,10 +633,12 @@ func (d *Daemon) replaceConversations(convs []*gmproto.Conversation) {
 	}
 
 	go d.fetchAvatars(d.sessionContext(), convs)
+	d.startPromotionChecks(list)
 }
 
 func (d *Daemon) upsertConversation(c *gmproto.Conversation) {
 	w := convertConversation(c)
+	d.applyPromotion(&w)
 	d.mu.Lock()
 	if p, ok := d.avatars.cached(w.ID); ok {
 		w.AvatarPath = p
@@ -638,6 +648,7 @@ func (d *Daemon) upsertConversation(c *gmproto.Conversation) {
 	d.mu.Unlock()
 	d.publish(wire.EventConversation, w)
 	d.publishStatus()
+	d.startPromotionChecks([]wire.Conversation{w})
 }
 
 // reorderLocked rebuilds the ordering: pinned first, then newest-first.

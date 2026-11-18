@@ -192,6 +192,40 @@ type Conversation struct {
 	Initials     string        `json:"initials"`
 	OutgoingID   string        `json:"outgoingID,omitempty"`
 	Participants []Participant `json:"participants,omitempty"`
+	// Kind is the transport inside the service: "sms" or "rcs" for Google
+	// Messages, otherwise the service name. Empty when unknown.
+	Kind string `json:"kind,omitempty"`
+	// Contact reports that the other party is saved in the phone's address book
+	// (Facebook friends count for Messenger).
+	Contact bool `json:"contact"`
+	// Known is Contact, or a thread the user has replied in that is not a
+	// business short code. The "People" views list only known conversations.
+	Known bool `json:"known"`
+}
+
+// Conversation kinds.
+const (
+	KindSMS       = "sms"
+	KindRCS       = "rcs"
+	KindWhatsApp  = "whatsapp"
+	KindMessenger = "messenger"
+)
+
+// WithServiceDefaults fills Kind, Contact and Known for services that have no
+// address-book signal of their own: every conversation there is a person the
+// user chose to talk to, so it counts as known.
+func (c Conversation) WithServiceDefaults(network string) Conversation {
+	if c.Kind == "" {
+		switch network {
+		case NetworkMessenger:
+			c.Kind = KindMessenger
+		case NetworkTelegram, NetworkSignal:
+			c.Kind = network
+		}
+	}
+	c.Contact = true
+	c.Known = true
+	return c
 }
 
 // Participant is one member of a conversation.

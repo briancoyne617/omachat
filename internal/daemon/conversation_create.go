@@ -103,6 +103,7 @@ func getOrCreateGoogleConversation(ctx context.Context, numbers []*gmproto.Conta
 
 func (d *Daemon) commitCreatedConversation(c *gmproto.Conversation) wire.Conversation {
 	w := convertConversation(c)
+	d.applyPromotion(&w)
 	d.mu.Lock()
 	if existing, ok := d.convs[w.ID]; ok {
 		w = existing

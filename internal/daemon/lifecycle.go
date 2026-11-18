@@ -96,6 +96,7 @@ func (d *Daemon) resetSessionLocked() (*libgm.Client, error) {
 	d.cookies.mu.Unlock()
 	d.media.reset()
 	d.avatars.reset()
+	d.promo.reset()
 	d.reactMu.Lock()
 	d.reactions = make(map[string][]reactionRecord)
 	d.reactionOrder = nil
