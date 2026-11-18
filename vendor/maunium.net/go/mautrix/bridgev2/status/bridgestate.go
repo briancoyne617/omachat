@@ -32,9 +32,7 @@ type BridgeStateErrorCode string
 type BridgeStateErrorMap map[BridgeStateErrorCode]string
 
 func (bem BridgeStateErrorMap) Update(data BridgeStateErrorMap) {
-	for key, value := range data {
-		bem[key] = value
-	}
+	maps.Copy(bem, data)
 }
 
 var BridgeStateHumanErrors = make(BridgeStateErrorMap)
@@ -81,6 +79,8 @@ const (
 	UserActionRelogin    BridgeStateUserAction = "RELOGIN"
 	UserActionRestart    BridgeStateUserAction = "RESTART"
 )
+
+const InfoKeyNotice = "notice"
 
 type RemoteProfile struct {
 	Phone    string              `json:"phone,omitempty"`
@@ -131,8 +131,13 @@ type BridgeState struct {
 	RemoteName    string                `json:"remote_name,omitempty"`
 	RemoteProfile RemoteProfile         `json:"remote_profile,omitzero"`
 
-	Reason string                 `json:"reason,omitempty"`
-	Info   map[string]interface{} `json:"info,omitempty"`
+	Version any `json:"version,omitempty"`
+
+	Reason string         `json:"reason,omitempty"`
+	Info   map[string]any `json:"info,omitempty"`
+
+	// If true, the unknown error auto-reconnect loop will not be triggered for this state.
+	BlockAutoReconnect bool `json:"-"`
 }
 
 type GlobalBridgeState struct {
@@ -162,6 +167,9 @@ func (pong BridgeState) Fill(user BridgeStateFiller) BridgeState {
 		}
 	} else {
 		pong.TTL = 21600
+	}
+	if pong.StateEvent == StateBadCredentials && pong.UserAction == "" {
+		pong.UserAction = UserActionRelogin
 	}
 	return pong
 }

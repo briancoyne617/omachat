@@ -15,9 +15,19 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/util/exhttp"
 )
+
+// fixtureClient satisfies the parent interface needed to build request clients.
+type fixtureClient struct{}
+
+func (fixtureClient) GetPlatform() types.Platform  { return types.Facebook }
+func (fixtureClient) GetLogger() *zerolog.Logger   { l := zerolog.Nop(); return &l }
+func (fixtureClient) GetCookies() *cookies.Cookies { return nil }
+func (fixtureClient) GetEndpoint(string) string    { return "" }
+func (fixtureClient) IsAuthenticated() bool        { return false }
 
 // Pin the policy independently of the implementation. Fixture readers are
 // finite so removing the production limit cannot exhaust the test machine.
@@ -135,7 +145,7 @@ func TestResponseLimitGzipTransport(t *testing.T) {
 					roots := x509.NewCertPool()
 					roots.AddCert(srv.Certificate())
 					log := zerolog.Nop()
-					c := &HTTPClient{log: &log}
+					c := &HTTPClient{log: &log, parent: fixtureClient{}}
 					c.SetConfig(exhttp.ClientSettings{TLSConfig: &tls.Config{RootCAs: roots}, DisableHTTP2: !http2})
 					defer c.HTTP.CloseIdleConnections()
 					defer c.websocketClient.CloseIdleConnections()
@@ -169,7 +179,7 @@ func TestResponseReadCancellation(t *testing.T) {
 	}))
 	defer srv.Close()
 	log := zerolog.Nop()
-	c := &HTTPClient{log: &log}
+	c := &HTTPClient{log: &log, parent: fixtureClient{}}
 	c.SetConfig(exhttp.ClientSettings{})
 	defer c.HTTP.CloseIdleConnections()
 	defer c.websocketClient.CloseIdleConnections()

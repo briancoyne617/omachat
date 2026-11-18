@@ -19,7 +19,7 @@ type HTTPProxyRequest struct {
 	Headers http.Header     `json:"headers"`
 	Body    json.RawMessage `json:"body"`
 
-	EscapedPath bool `json:"escaped_path,omitempty"`
+	EscapedPath bool `json:"escaped_path,omitzero"`
 }
 
 type HTTPProxyResponse struct {
@@ -45,7 +45,7 @@ func (p *HTTPProxyResponse) WriteHeader(statusCode int) {
 	p.Status = statusCode
 }
 
-func (as *AppService) WebsocketHTTPProxy(cmd WebsocketCommand) (bool, interface{}) {
+func (as *AppService) WebsocketHTTPProxy(cmd WebsocketCommand) (bool, any) {
 	var req HTTPProxyRequest
 	if err := json.Unmarshal(cmd.Data, &req); err != nil {
 		return false, fmt.Errorf("failed to parse proxy request: %w", err)

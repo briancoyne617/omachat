@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -43,6 +44,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 )
+
+var ErrICDCUnauthorized = errors.New("unexpected status code 401")
 
 type ICDCFetchResponse struct {
 	DeviceIdentities []string `json:"device_identities"`
@@ -110,7 +113,9 @@ func (c *Client) doE2EERequest(ctx context.Context, endpoint string, body url.Va
 		logEvt.Str("response_body", base64.StdEncoding.EncodeToString(respBody))
 	}
 	logEvt.Msg("ICDC response")
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrICDCUnauthorized
+	} else if resp.StatusCode >= 300 || resp.StatusCode < 200 {
 		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	} else if err = json.Unmarshal(respBody, into); err != nil {
 		return fmt.Errorf("failed to unmarshal response: %w", err)

@@ -7,14 +7,14 @@ them from the source; it does not reproduce either value. Checked October 17,
 
 | Location | Upstream module | What the string is |
 | --- | --- | --- |
-| `vendor/go.mau.fi/whatsmeow/binary/token/token.go:13` | `go.mau.fi/whatsmeow` `v0.0.0-20260909164725-b25a56d63729` | Entry 62 of `DoubleByteTokens[2]`, WhatsApp's binary XML token dictionary |
+| `vendor/go.mau.fi/whatsmeow/binary/token/token.go:13` | `go.mau.fi/whatsmeow` `v0.0.0-20261116172437-19d61352436f` | Entry 62 of `DoubleByteTokens[2]`, WhatsApp's binary XML token dictionary |
 | `vendor/go.mau.fi/mautrix-gmessages/pkg/libgm/util/constants.go:3` | `go.mau.fi/mautrix-gmessages` `v0.2608.0` | `GoogleAPIKey`, the Google Messages for Web client key |
 
 ## Evidence
 
 - Both vendored files are byte-identical to the upstream sources at the pinned
   versions (SHA-256 compared against the upstream repositories at commit
-  `b25a56d63729` and tag `v0.2608.0`). OmaChat did not add or change either
+  `19d61352436f` and tag `v0.2608.0`). OmaChat did not add or change either
   string.
 - Each value occurs exactly once in the repository, in its vendored file. No
   OmaChat source, test, fixture, document, or configuration contains it.

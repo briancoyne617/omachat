@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/jsontime"
@@ -83,8 +84,13 @@ func (c *Client) Version(ctx context.Context, serverName string) (resp *RespServ
 	return
 }
 
+var ErrMismatchingServerName = errors.New("mismatching server name")
+
 func (c *Client) ServerKeys(ctx context.Context, serverName string) (resp *ServerKeyResponse, err error) {
 	err = c.MakeRequest(ctx, serverName, false, http.MethodGet, KeyURLPath{"v2", "server"}, nil, &resp)
+	if err == nil && resp.ServerName != serverName {
+		err = fmt.Errorf("%w: %q != %q", ErrMismatchingServerName, serverName, resp.ServerName)
+	}
 	return
 }
 
@@ -161,8 +167,8 @@ type ReqGetMissingEvents struct {
 	RoomID         id.RoomID    `json:"-"`
 	EarliestEvents []id.EventID `json:"earliest_events"`
 	LatestEvents   []id.EventID `json:"latest_events"`
-	Limit          int          `json:"limit,omitempty"`
-	MinDepth       int          `json:"min_depth,omitempty"`
+	Limit          int          `json:"limit,omitzero"`
+	MinDepth       int          `json:"min_depth,omitzero"`
 }
 
 type RespGetMissingEvents struct {
@@ -232,13 +238,14 @@ func (c *Client) TimestampToEvent(ctx context.Context, serverName string, roomID
 	return
 }
 
-func (c *Client) QueryProfile(ctx context.Context, serverName string, userID id.UserID) (resp *mautrix.RespUserProfile, err error) {
-	err = c.Query(ctx, serverName, "profile", url.Values{"user_id": {userID.String()}}, &resp)
+func (c *Client) QueryProfile(ctx context.Context, userID id.UserID) (resp *mautrix.RespUserProfile, err error) {
+	err = c.Query(ctx, userID.Homeserver(), "profile", url.Values{"user_id": {userID.String()}}, &resp)
 	return
 }
 
-func (c *Client) QueryDirectory(ctx context.Context, serverName string, roomAlias id.RoomAlias) (resp *mautrix.RespAliasResolve, err error) {
-	err = c.Query(ctx, serverName, "directory", url.Values{"room_alias": {roomAlias.String()}}, &resp)
+func (c *Client) QueryDirectory(ctx context.Context, roomAlias id.RoomAlias) (resp *mautrix.RespAliasResolve, err error) {
+	_, _, homeserver := id.ParseCommonIdentifier(roomAlias)
+	err = c.Query(ctx, homeserver, "directory", url.Values{"room_alias": {roomAlias.String()}}, &resp)
 	return
 }
 
@@ -286,6 +293,12 @@ func (c *Client) GetOpenIDUserInfo(ctx context.Context, serverName, accessToken 
 		Query:        url.Values{"access_token": {accessToken}},
 		ResponseJSON: &resp,
 	})
+	if resp != nil && resp.Sub.Homeserver() != serverName {
+		if err == nil {
+			err = fmt.Errorf("user ID %s does not belong to server %s", resp.Sub, serverName)
+		}
+		resp = nil
+	}
 	return
 }
 
@@ -297,7 +310,7 @@ type ReqMakeJoin struct {
 }
 
 type RespMakeJoin struct {
-	RoomVersion id.RoomVersion `json:"room_version"`
+	RoomVersion id.RoomVersion `json:"room_version,omitempty"`
 	Event       PDU            `json:"event"`
 }
 
@@ -318,9 +331,9 @@ type ReqSendKnock struct {
 
 type RespSendJoin struct {
 	AuthChain      []PDU    `json:"auth_chain"`
-	Event          PDU      `json:"event"`
-	MembersOmitted bool     `json:"members_omitted"`
-	ServersInRoom  []string `json:"servers_in_room"`
+	Event          PDU      `json:"event,omitempty"`
+	MembersOmitted bool     `json:"members_omitted,omitzero"`
+	ServersInRoom  []string `json:"servers_in_room,omitempty"`
 	State          []PDU    `json:"state"`
 }
 
@@ -331,6 +344,7 @@ type RespSendKnock struct {
 type ReqSendInvite struct {
 	RoomID          id.RoomID      `json:"-"`
 	UserID          id.UserID      `json:"-"`
+	EventID         id.EventID     `json:"-"`
 	Event           PDU            `json:"event"`
 	InviteRoomState []PDU          `json:"invite_room_state"`
 	RoomVersion     id.RoomVersion `json:"room_version"`
@@ -422,7 +436,7 @@ func (c *Client) SendInvite(ctx context.Context, req *ReqSendInvite) (resp *Resp
 	_, _, err = c.MakeFullRequest(ctx, RequestParams{
 		ServerName:   req.UserID.Homeserver(),
 		Method:       http.MethodPut,
-		Path:         URLPath{"v2", "invite", req.RoomID, req.UserID},
+		Path:         URLPath{"v2", "invite", req.RoomID, req.EventID},
 		Authenticate: true,
 		RequestJSON:  req,
 		ResponseJSON: &resp,
@@ -488,12 +502,17 @@ func (c *Client) MakeRequest(ctx context.Context, serverName string, authenticat
 	return err
 }
 
-func (c *Client) MakeFullRequest(ctx context.Context, params RequestParams) ([]byte, *http.Response, error) {
+func (c *Client) MakeFullRequest(ctx context.Context, params RequestParams) (body []byte, resp *http.Response, retErr error) {
 	req, err := c.compileRequest(ctx, params)
 	if err != nil {
 		return nil, nil, err
 	}
-	resp, err := c.HTTP.Do(req)
+	start := time.Now()
+	resp, err = c.HTTP.Do(req)
+	dur := time.Since(start)
+	defer func() {
+		c.logRequestDone(req, resp, err, dur, params.ServerName)
+	}()
 	if err != nil {
 		return nil, nil, mautrix.HTTPError{
 			Request:  req,
@@ -506,7 +525,6 @@ func (c *Client) MakeFullRequest(ctx context.Context, params RequestParams) ([]b
 	if !params.DontReadBody {
 		defer resp.Body.Close()
 	}
-	var body []byte
 	if resp.StatusCode >= 300 {
 		body, err = mautrix.ParseErrorResponse(req, resp)
 		return body, resp, err
@@ -533,6 +551,9 @@ func (c *Client) MakeFullRequest(ctx context.Context, params RequestParams) ([]b
 				WrappedError: err,
 			}
 		}
+		if resp.ContentLength == -1 {
+			resp.ContentLength = int64(len(body))
+		}
 		if params.ResponseJSON != nil {
 			err = json.Unmarshal(body, params.ResponseJSON)
 			if err != nil {
@@ -550,10 +571,46 @@ func (c *Client) MakeFullRequest(ctx context.Context, params RequestParams) ([]b
 	return body, resp, nil
 }
 
+func (c *Client) logRequestDone(req *http.Request, resp *http.Response, err error, duration time.Duration, serverName string) {
+	if c == nil {
+		return
+	}
+	var evt *zerolog.Event
+	logLevel := zerolog.DebugLevel
+	if errors.Is(err, context.Canceled) {
+		logLevel = zerolog.WarnLevel
+	} else if err != nil {
+		logLevel = zerolog.ErrorLevel
+	}
+	evt = zerolog.Ctx(req.Context()).WithLevel(logLevel).
+		Str("dest_server_name", serverName).
+		Str("method", req.Method).
+		Str("url", req.URL.String()).
+		Dur("duration", duration)
+	if resp != nil {
+		evt.Int("status_code", resp.StatusCode).
+			Int64("response_length", resp.ContentLength).
+			Str("response_mime", resp.Header.Get("Content-Type"))
+		if serverRequestID := resp.Header.Get("X-Beeper-Request-ID"); serverRequestID != "" {
+			evt.Str("beeper_request_id", serverRequestID)
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		evt.Err(err).Msg("Request canceled")
+	} else if err != nil {
+		evt.Err(err).Msg("Request failed")
+	} else {
+		evt.Msg("Request completed")
+	}
+}
+
 var ErrNotConfiguredForAuth = errors.New("client not configured for authentication")
 var ErrServerNameFiltered = errors.New("refusing to make a request")
 
 func (c *Client) compileRequest(ctx context.Context, params RequestParams) (*http.Request, error) {
+	if !id.ValidateServerName(params.ServerName) {
+		return nil, ErrInvalidServerName
+	}
 	if c.AllowServer != nil && !c.AllowServer(params.ServerName) {
 		return nil, fmt.Errorf("%w to %s", ErrServerNameFiltered, params.ServerName)
 	}

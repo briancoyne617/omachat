@@ -10,10 +10,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exerrors"
 
 	"maunium.net/go/mautrix/bridgev2/database"
 )
@@ -131,6 +133,13 @@ func (mt *ManualBackfill) addLogAndDo(ctx context.Context) {
 		with = mt.LogContext(with)
 	}
 	log := with.Logger()
+	defer func() {
+		if v := recover(); v != nil {
+			log.Err(exerrors.RecoverToError(v)).
+				Bytes(zerolog.ErrorStackFieldName, debug.Stack()).
+				Msg("Panic in manual backfill task")
+		}
+	}()
 	ctx = log.WithContext(ctx)
 	mt.Do(ctx)
 }
@@ -164,14 +173,23 @@ func (mt *ManualBackfill) Do(ctx context.Context) {
 		}
 	}()
 	var task *database.BackfillTask
+	var dispatched bool
 	updateTask := false
 	task, err = mt.Portal.Bridge.DB.BackfillTask.GetNextForPortal(ctx, mt.Portal.PortalKey, mt.Data != nil)
 	if err != nil {
 		log.Err(err).Msg("Failed to get backfill task from database")
 	} else if task == nil {
 		log.Warn().Msg("No backfill task found for portal")
-	} else if err = mt.Portal.Bridge.DB.BackfillTask.MarkDispatched(ctx, task); err != nil {
+	} else if dispatched, err = mt.Portal.Bridge.DB.BackfillTask.MarkDispatched(ctx, task); err != nil {
 		log.Err(err).Msg("Failed to mark backfill task as dispatched")
+	} else if !dispatched {
+		completed = true
+		err = RespError{
+			ErrCode:    "FI.MAU.BRIDGEV2_BACKFILL_TASK_CONFLICT",
+			Err:        "Backfill task changed before dispatch",
+			StatusCode: http.StatusConflict,
+		}
+		log.Debug().Msg("Backfill task changed before dispatch")
 	} else if completed, err = mt.Portal.doBackfillTask(ctx, mt.Source, task, mt.Data); err != nil {
 		log.Err(err).Msg("Failed to do backwards backfill from event")
 		updateTask = errors.Is(err, errNoMessagesLeftAfterCutoff)
@@ -194,23 +212,20 @@ func (br *Bridge) DoBackfillTask(ctx context.Context, task *database.BackfillTas
 		Str("login_id", string(task.UserLoginID)).
 		Logger()
 	defer func() {
-		err := recover()
-		if err != nil {
-			logEvt := log.Error().
-				Bytes(zerolog.ErrorStackFieldName, debug.Stack())
-			if realErr, ok := err.(error); ok {
-				logEvt = logEvt.Err(realErr)
-			} else {
-				logEvt = logEvt.Any(zerolog.ErrorFieldName, err)
-			}
-			logEvt.Msg("Panic in backfill queue")
+		if v := recover(); v != nil {
+			log.Err(exerrors.RecoverToError(v)).
+				Bytes(zerolog.ErrorStackFieldName, debug.Stack()).
+				Msg("Panic in backfill queue")
 		}
 	}()
 	ctx = log.WithContext(ctx)
-	err := br.DB.BackfillTask.MarkDispatched(ctx, task)
+	dispatched, err := br.DB.BackfillTask.MarkDispatched(ctx, task)
 	if err != nil {
 		log.Err(err).Msg("Failed to mark backfill task as dispatched")
 		time.Sleep(BackfillQueueErrorBackoff)
+		return
+	} else if !dispatched {
+		log.Debug().Msg("Backfill task changed before dispatch")
 		return
 	}
 	updateTask := true

@@ -23,6 +23,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -97,7 +98,7 @@ func NewBridge(
 	}
 	br.Commands = newCommandProcessor(br)
 	br.Matrix.Init(br)
-	br.Bot = br.Matrix.BotIntent()
+	br.Bot = br.Matrix.(botIntentGetter).BotIntent()
 	br.Network.Init(br)
 	br.DisappearLoop = &DisappearLoop{br: br}
 	return br
@@ -215,6 +216,7 @@ func (br *Bridge) StartConnectors(ctx context.Context) error {
 	if br.Network.GetCapabilities().DisappearingMessages && !br.Background {
 		go br.DisappearLoop.Start()
 	}
+	br.startUnknownRoomCleanup(ctx)
 	return nil
 }
 
@@ -312,6 +314,13 @@ func (br *Bridge) MigrateToSplitPortals(ctx context.Context) (bool, func(), erro
 	} else if alreadyMigrated {
 		return false, nil, nil
 	}
+	spmn, ok := br.Network.(SplitPortalMigratingNetwork)
+	if ok {
+		err := spmn.PreSplitPortalMigrate(ctx)
+		if err != nil {
+			return false, nil, fmt.Errorf("failed to prepare split portal migration: %w", err)
+		}
+	}
 	affected, err := br.DB.Portal.MigrateToSplitPortals(ctx)
 	if err != nil {
 		log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to migrate portals")
@@ -324,6 +333,17 @@ func (br *Bridge) MigrateToSplitPortals(ctx context.Context) (bool, func(), erro
 		return false, nil, fmt.Errorf("failed to fix parent portals: %w", err)
 	}
 	log.Info().Int64("rows_affected", affected2).Msg("Updated parent receivers after split portal migration")
+	staleSpaceChildren, err := br.DB.UserPortal.GetNonReceiverSpaceChildren(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to get spaces of non-receiver logins after split portal migration")
+		return false, nil, fmt.Errorf("failed to get spaces of non-receiver logins: %w", err)
+	}
+	affected3, err := br.DB.UserPortal.DeleteNonReceiverAfterSplitPortalMigration(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to delete user portals of non-receiver logins after split portal migration")
+		return false, nil, fmt.Errorf("failed to delete non-receiver user portals: %w", err)
+	}
+	log.Info().Int64("rows_affected", affected3).Msg("Deleted user portals of non-receiver logins after split portal migration")
 	withoutReceiver, err := br.DB.Portal.GetAllWithoutReceiver(ctx)
 	if err != nil {
 		log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to get portals that failed to migrate")
@@ -360,39 +380,73 @@ func (br *Bridge) MigrateToSplitPortals(ctx context.Context) (bool, func(), erro
 			}
 		}
 		log.Info().Int("room_count", len(roomsToDelete)).Msg("Finished deleting rooms that failed to migrate")
+		for _, sc := range staleSpaceChildren {
+			_, err = br.Bot.SendState(ctx, sc.SpaceRoom, event.StateSpaceChild, sc.ChildRoom.String(), &event.Content{
+				Parsed: &event.SpaceChildEventContent{},
+			}, time.Now())
+			if err != nil {
+				log.Err(err).
+					Stringer("space_room_id", sc.SpaceRoom).
+					Stringer("portal_mxid", sc.ChildRoom).
+					Msg("Failed to remove portal from space of non-receiver login")
+			}
+		}
+		log.Info().Int("portal_count", len(staleSpaceChildren)).Msg("Finished removing portals from spaces of non-receiver logins")
 	}, nil
 }
 
 func (br *Bridge) StartLogins(ctx context.Context) error {
+	users, err := br.GetUsersToStart(ctx)
+	if err != nil {
+		return err
+	}
+	br.StartLoginsForUsers(ctx, users)
+	return nil
+}
+
+func (br *Bridge) GetUsersToStart(ctx context.Context) ([]*User, error) {
 	userIDs, err := br.DB.UserLogin.GetAllUserIDsWithLogins(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get users with logins: %w", err)
+		return nil, fmt.Errorf("failed to get users with logins: %w", err)
 	}
-	startedAny := false
-	for _, userID := range userIDs {
+	users := make([]*User, len(userIDs))
+	for i, userID := range userIDs {
 		br.Log.Info().Stringer("user_id", userID).Msg("Loading user")
-		var user *User
-		user, err = br.GetUserByMXID(ctx, userID)
+		users[i], err = br.GetUserByMXID(ctx, userID)
 		if err != nil {
-			br.Log.Err(err).Stringer("user_id", userID).Msg("Failed to load user")
-		} else {
-			for _, login := range user.GetUserLogins() {
-				startedAny = true
-				br.Log.Info().Str("id", string(login.ID)).Msg("Starting user login")
-				login.Client.Connect(login.Log.WithContext(ctx))
-			}
+			return nil, fmt.Errorf("failed to load user %s: %w", userID, err)
+		}
+	}
+	return users, nil
+}
+
+func (br *Bridge) StartLoginsForUsers(ctx context.Context, users []*User) {
+	startedAny := false
+	for _, user := range users {
+		for _, login := range user.GetUserLogins() {
+			startedAny = true
+			br.Log.Info().Str("id", string(login.ID)).Msg("Starting user login")
+			login.Client.Connect(login.Log.WithContext(ctx))
 		}
 	}
 	if !startedAny {
 		br.Log.Info().Msg("No user logins found")
-		br.SendGlobalBridgeState(status.BridgeState{StateEvent: status.StateUnconfigured})
+		br.SendGlobalBridgeState(ctx, status.BridgeState{StateEvent: status.StateUnconfigured})
 	}
 	if !br.Background {
 		go br.RunBackfillQueue()
 	}
 
 	br.Log.Info().Msg("Bridge started")
-	return nil
+}
+
+func (br *Bridge) GenerateContentURI(ctx context.Context, roomID id.RoomID, mediaID networkid.MediaID) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	edm, ok := br.Matrix.(MatrixConnectorWithEncryptedDirectMedia)
+	if ok {
+		return edm.GenerateContentURIWithCrypto(ctx, roomID, mediaID)
+	}
+	mxc, err := br.Matrix.GenerateContentURI(ctx, mediaID)
+	return mxc, nil, err
 }
 
 func (br *Bridge) ResetNetworkConnections() {
@@ -456,6 +510,7 @@ func (br *Bridge) stop(isRunOnce bool, timeout time.Duration) {
 		for _, login := range br.userLoginsByID {
 			go func() {
 				login.DisconnectWithTimeout(timeout)
+				login.BridgeState.Destroy()
 				wg.Done()
 			}()
 		}

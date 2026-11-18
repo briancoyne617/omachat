@@ -51,7 +51,6 @@ type MatrixConnector interface {
 	FormatGhostMXID(userID networkid.UserID) id.UserID
 	GhostIntent(userID networkid.UserID) MatrixAPI
 	NewUserIntent(ctx context.Context, userID id.UserID, accessToken string) (MatrixAPI, string, error)
-	BotIntent() MatrixAPI
 
 	SendBridgeStatus(ctx context.Context, state *status.BridgeState) error
 	SendMessageStatus(ctx context.Context, status *MessageStatus, evt *MessageStatusEventInfo)
@@ -71,6 +70,16 @@ type MatrixConnector interface {
 	ServerName() string
 }
 
+type botIntentGetter interface {
+	MatrixConnector
+	BotIntent() MatrixAPI
+}
+
+type MatrixConnectorWithEncryptedDirectMedia interface {
+	MatrixConnector
+	GenerateContentURIWithCrypto(ctx context.Context, roomID id.RoomID, mediaID networkid.MediaID) (id.ContentURIString, *event.EncryptedFileInfo, error)
+}
+
 type MatrixConnectorWithArbitraryRoomState interface {
 	MatrixConnector
 	GetStateEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string) (*event.Event, error)
@@ -85,6 +94,8 @@ type MatrixConnectorWithServer interface {
 type IProvisioningAPI interface {
 	GetRouter() *http.ServeMux
 	GetUser(r *http.Request) *User
+	GetExplicitLoginForRequest(w http.ResponseWriter, r *http.Request) (login *UserLogin, failed bool)
+	GetLoginForRequest(w http.ResponseWriter, r *http.Request) *UserLogin
 }
 
 type MatrixConnectorWithProvisioning interface {
@@ -149,11 +160,12 @@ type MatrixConnectorWithHTTPSettings interface {
 }
 
 type MatrixSendExtra struct {
-	Timestamp    time.Time
-	MessageMeta  *database.Message
-	ReactionMeta *database.Reaction
-	StreamOrder  int64
-	PartIndex    int
+	TransactionID string
+	Timestamp     time.Time
+	MessageMeta   *database.Message
+	ReactionMeta  *database.Reaction
+	StreamOrder   int64
+	PartIndex     int
 }
 
 // FileStreamResult is the result of a FileStreamCallback.
@@ -225,6 +237,11 @@ type MatrixAPI interface {
 	GetEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (*event.Event, error)
 }
 
+type ThreadReadingMatrixAPI interface {
+	MatrixAPI
+	MarkThreadRead(ctx context.Context, roomID id.RoomID, eventID id.EventID, ts time.Time, threadID id.EventID) error
+}
+
 type StreamOrderReadingMatrixAPI interface {
 	MatrixAPI
 	MarkStreamOrderRead(ctx context.Context, roomID id.RoomID, streamOrder int64, ts time.Time) error
@@ -241,4 +258,9 @@ type MarkAsDMMatrixAPI interface {
 type MatrixAPIWithArbitraryRoomState interface {
 	MatrixAPI
 	GetStateEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string) (*event.Event, error)
+}
+
+type MatrixAPIWithRoomListing interface {
+	MatrixAPI
+	GetJoinedRooms(ctx context.Context) ([]id.RoomID, error)
 }

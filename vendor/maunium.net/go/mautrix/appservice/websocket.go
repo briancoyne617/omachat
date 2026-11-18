@@ -28,13 +28,13 @@ import (
 )
 
 type WebsocketRequest struct {
-	ReqID   int    `json:"id,omitempty"`
+	ReqID   int    `json:"id,omitzero"`
 	Command string `json:"command"`
 	Data    any    `json:"data"`
 }
 
 type WebsocketCommand struct {
-	ReqID   int             `json:"id,omitempty"`
+	ReqID   int             `json:"id,omitzero"`
 	Command string          `json:"command"`
 	Data    json.RawMessage `json:"data"`
 
@@ -224,7 +224,7 @@ func (er *ErrorResponse) Error() string {
 }
 
 func (as *AppService) RequestWebsocket(ctx context.Context, cmd *WebsocketRequest, response any) error {
-	cmd.ReqID = int(atomic.AddInt32(&as.websocketRequestID, 1))
+	cmd.ReqID = int(as.websocketRequestID.Add(1))
 	respChan := make(chan *WebsocketCommand, 1)
 	as.addWebsocketResponseWaiter(cmd.ReqID, respChan)
 	defer as.removeWebsocketResponseWaiter(cmd.ReqID, respChan)
@@ -384,7 +384,7 @@ func (as *AppService) StartWebsocket(ctx context.Context, baseURL string, onConn
 		HTTPClient: as.HTTPClient,
 		HTTPHeader: http.Header{
 			"Authorization": []string{fmt.Sprintf("Bearer %s", as.Registration.AppToken)},
-			"User-Agent":    []string{as.BotClient().UserAgent},
+			"User-Agent":    []string{as.UserAgent},
 
 			"X-Mautrix-Process-ID":        []string{as.ProcessID},
 			"X-Mautrix-Websocket-Version": []string{"3"},

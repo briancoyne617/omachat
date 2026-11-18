@@ -71,23 +71,28 @@ type BridgeConfig struct {
 	AsyncEvents                   bool               `yaml:"async_events"`
 	SplitPortals                  bool               `yaml:"split_portals"`
 	ResendBridgeInfo              bool               `yaml:"resend_bridge_info"`
+	CleanupUnknownRooms           bool               `yaml:"cleanup_unknown_rooms"`
 	NoBridgeInfoStateKey          bool               `yaml:"no_bridge_info_state_key"`
 	BridgeStatusNotices           string             `yaml:"bridge_status_notices"`
 	TransientStateDebounce        time.Duration      `yaml:"transient_state_debounce"`
+	SendReconnectWait             time.Duration      `yaml:"send_reconnect_wait"`
 	UnknownErrorAutoReconnect     time.Duration      `yaml:"unknown_error_auto_reconnect"`
 	UnknownErrorMaxAutoReconnects int                `yaml:"unknown_error_max_auto_reconnects"`
 	BridgeMatrixLeave             bool               `yaml:"bridge_matrix_leave"`
+	DropMatrixProfileChanges      bool               `yaml:"drop_matrix_profile_changes"`
 	BridgeNotices                 bool               `yaml:"bridge_notices"`
 	TagOnlyOnCreate               bool               `yaml:"tag_only_on_create"`
 	OnlyBridgeTags                []event.RoomTag    `yaml:"only_bridge_tags"`
 	MuteOnlyOnCreate              bool               `yaml:"mute_only_on_create"`
 	DeduplicateMatrixMessages     bool               `yaml:"deduplicate_matrix_messages"`
+	PortalEventBuffer             int                `yaml:"portal_event_buffer"`
 	CrossRoomReplies              bool               `yaml:"cross_room_replies"`
 	OutgoingMessageReID           bool               `yaml:"outgoing_message_re_id"`
 	RevertFailedStateChanges      bool               `yaml:"revert_failed_state_changes"`
 	KickMatrixUsers               bool               `yaml:"kick_matrix_users"`
 	EnableSendStateRequests       bool               `yaml:"enable_send_state_requests"`
 	PhoneNumbersInProfile         bool               `yaml:"phone_numbers_in_profile"`
+	ViewLimitedMedia              bool               `yaml:"view_limited_media"`
 	CleanupOnLogout               CleanupOnLogouts   `yaml:"cleanup_on_logout"`
 	Relay                         RelayConfig        `yaml:"relay"`
 	PortalCreateFilter            PortalCreateFilter `yaml:"portal_create_filter"`
@@ -103,6 +108,7 @@ type MatrixConfig struct {
 	FederateRooms         bool  `yaml:"federate_rooms"`
 	UploadFileThreshold   int64 `yaml:"upload_file_threshold"`
 	GhostExtraProfileInfo bool  `yaml:"ghost_extra_profile_info"`
+	MaxDownloadSize       int64 `yaml:"max_download_size"`
 }
 
 type AnalyticsConfig struct {
@@ -115,7 +121,6 @@ type ProvisioningConfig struct {
 	SharedSecret           string `yaml:"shared_secret"`
 	AllowMatrixAuth        bool   `yaml:"allow_matrix_auth"`
 	DebugEndpoints         bool   `yaml:"debug_endpoints"`
-	EnableSessionTransfers bool   `yaml:"enable_session_transfers"`
 	FailOnWebAuthn         bool   `yaml:"fail_on_webauthn"`
 	RequestIDHeader        string `yaml:"request_id_header"`
 	TrustIncomingRequestID bool   `yaml:"trust_incoming_request_id"`
@@ -123,6 +128,8 @@ type ProvisioningConfig struct {
 
 type DirectMediaConfig struct {
 	Enabled                bool   `yaml:"enabled"`
+	Encrypted              bool   `yaml:"encrypted"`
+	ServeOnly              bool   `yaml:"serve_only"`
 	MediaIDPrefix          string `yaml:"media_id_prefix"`
 	mediaproxy.BasicConfig `yaml:",inline"`
 }

@@ -26,10 +26,10 @@ import (
 	"github.com/rs/zerolog/hlog"
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/exhttp"
-	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/requestlog"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 )
@@ -48,8 +48,17 @@ type GetMediaResponseURL struct {
 	ExpiresAt time.Time
 }
 
-type GetMediaResponseWriter interface {
+type GetMediaResponseEncryptable interface {
 	GetMediaResponse
+	WithEncryption(crypto *attachment.EncryptedFile) GetMediaResponseEncryptable
+}
+
+var (
+	_ GetMediaResponseEncryptable = (*GetMediaResponseFile)(nil)
+)
+
+type GetMediaResponseWriter interface {
+	GetMediaResponseEncryptable
 	io.WriterTo
 	GetContentType() string
 	GetContentLength() int64
@@ -64,6 +73,26 @@ type GetMediaResponseData struct {
 	Reader        io.ReadCloser
 	ContentType   string
 	ContentLength int64
+	encryption    *attachment.EncryptedFile
+}
+
+func (d *GetMediaResponseData) WithEncryption(crypto *attachment.EncryptedFile) GetMediaResponseEncryptable {
+	if crypto == nil {
+		panic(fmt.Errorf("WithEncryption called with nil encryption"))
+	} else if d.encryption == crypto {
+		return d
+	} else if d.encryption != nil {
+		panic(fmt.Errorf("WithEncryption called on GetMediaResponseData that already has encryption"))
+	}
+	dCopy := *d
+	dCopy.Reader = crypto.EncryptStream(dCopy.Reader)
+	dCopy.ContentType = "application/octet-stream"
+	if crypto.Version != attachment.VersionAES256CTR {
+		// Other encryption algorithms may change the content length
+		dCopy.ContentLength = 0
+	}
+	dCopy.encryption = crypto
+	return &dCopy
 }
 
 func (d *GetMediaResponseData) WriteTo(w io.Writer) (int64, error) {
@@ -92,6 +121,15 @@ type GetMediaResponseCallback struct {
 	ContentLength int64
 }
 
+func (d *GetMediaResponseCallback) WithEncryption(crypto *attachment.EncryptedFile) GetMediaResponseEncryptable {
+	return (&GetMediaResponseFile{
+		Callback: func(w *os.File) (*FileMeta, error) {
+			_, err := d.Callback(w)
+			return nil, err
+		},
+	}).WithEncryption(crypto)
+}
+
 func (d *GetMediaResponseCallback) WriteTo(w io.Writer) (int64, error) {
 	return d.Callback(w)
 }
@@ -110,7 +148,21 @@ type FileMeta struct {
 }
 
 type GetMediaResponseFile struct {
-	Callback func(w *os.File) (*FileMeta, error)
+	Callback   func(w *os.File) (*FileMeta, error)
+	Encryption *attachment.EncryptedFile
+}
+
+func (f *GetMediaResponseFile) WithEncryption(crypto *attachment.EncryptedFile) GetMediaResponseEncryptable {
+	if crypto == nil {
+		panic(fmt.Errorf("WithEncryption called with nil encryption"))
+	} else if f.Encryption == crypto {
+		return f
+	} else if f.Encryption != nil {
+		panic(fmt.Errorf("WithEncryption called on GetMediaResponseFile that already has encryption"))
+	}
+	fCopy := *f
+	fCopy.Encryption = crypto
+	return &fCopy
 }
 
 type GetMediaFunc = func(ctx context.Context, mediaID string, params map[string]string) (response GetMediaResponse, err error)
@@ -221,8 +273,8 @@ func (mp *MediaProxy) EnableServerAuth(client *federation.Client, keyCache feder
 
 func (mp *MediaProxy) RegisterRoutes(router *http.ServeMux, log zerolog.Logger) {
 	errorBodies := exhttp.ErrorBodies{
-		NotFound:         exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Unrecognized endpoint")).MarshalJSON()),
-		MethodNotAllowed: exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Invalid method for endpoint")).MarshalJSON()),
+		NotFound:         exerrors.Must(new(mautrix.MUnrecognized.WithMessage("Unrecognized endpoint")).MarshalJSON()),
+		MethodNotAllowed: exerrors.Must(new(mautrix.MUnrecognized.WithMessage("Invalid method for endpoint")).MarshalJSON()),
 	}
 	router.Handle("/_matrix/federation/", exhttp.ApplyMiddleware(
 		mp.FederationRouter,
@@ -246,6 +298,12 @@ func (mp *MediaProxy) RegisterRoutes(router *http.ServeMux, log zerolog.Logger) 
 
 var ErrInvalidMediaIDSyntax = errors.New("invalid media ID syntax")
 
+var ErrNetworkError = mautrix.RespError{
+	ErrCode:    "FI.MAU.MEDIAPROXY.CONNECTION_ERROR",
+	Err:        "Failed to fetch media",
+	StatusCode: http.StatusBadGateway,
+}
+
 func queryToMap(vals url.Values) map[string]string {
 	m := make(map[string]string, len(vals))
 	for k, v := range vals {
@@ -262,13 +320,16 @@ func (mp *MediaProxy) getMedia(w http.ResponseWriter, r *http.Request) GetMediaR
 	}
 	resp, err := mp.GetMedia(r.Context(), mediaID, queryToMap(r.URL.Query()))
 	if err != nil {
-		var mautrixRespError mautrix.RespError
+		zerolog.Ctx(r.Context()).Err(err).
+			Str("media_id", mediaID).
+			Msg("Failed to get media URL")
 		if errors.Is(err, ErrInvalidMediaIDSyntax) {
 			mautrix.MNotFound.WithMessage("This is a media proxy at %q, other media downloads are not available here", mp.serverName).Write(w)
-		} else if errors.As(err, &mautrixRespError) {
+		} else if mautrixRespError, ok := errors.AsType[mautrix.RespError](err); ok {
 			mautrixRespError.Write(w)
+		} else if exhttp.IsNetworkError(err) {
+			ErrNetworkError.Write(w)
 		} else {
-			zerolog.Ctx(r.Context()).Err(err).Str("media_id", mediaID).Msg("Failed to get media URL")
 			mautrix.MNotFound.WithMessage("Media not found").Write(w)
 		}
 		return nil
@@ -326,7 +387,7 @@ func (mp *MediaProxy) DownloadMediaFederation(w http.ResponseWriter, r *http.Req
 			return
 		}
 	} else if fileResp, ok := resp.(*GetMediaResponseFile); ok {
-		responseStarted, err := doTempFileDownload(fileResp, func(wt io.WriterTo, size int64, mimeType string) error {
+		responseStarted, err := doTempFileDownload(fileResp, func(r io.Reader, size int64, mimeType string) error {
 			mpw = startMultipart(ctx, w)
 			if mpw == nil {
 				return fmt.Errorf("failed to start multipart writer")
@@ -337,14 +398,13 @@ func (mp *MediaProxy) DownloadMediaFederation(w http.ResponseWriter, r *http.Req
 			if err != nil {
 				return fmt.Errorf("failed to create multipart data field: %w", err)
 			}
-			_, err = wt.WriteTo(dataPart)
+			_, err = io.Copy(dataPart, r)
 			return err
 		})
 		if err != nil {
 			log.Err(err).Msg("Failed to do media proxy with temp file")
 			if !responseStarted {
-				var mautrixRespError mautrix.RespError
-				if errors.As(err, &mautrixRespError) {
+				if mautrixRespError, ok := errors.AsType[mautrix.RespError](err); ok {
 					mautrixRespError.Write(w)
 				} else {
 					mautrix.MUnknown.WithMessage("Internal error proxying media").Write(w)
@@ -423,18 +483,19 @@ func (mp *MediaProxy) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	} else if fileResp, ok := resp.(*GetMediaResponseFile); ok {
-		responseStarted, err := doTempFileDownload(fileResp, func(wt io.WriterTo, size int64, mimeType string) error {
+		responseStarted, err := doTempFileDownload(fileResp, func(rdr io.Reader, size int64, mimeType string) error {
 			mp.addHeaders(w, mimeType, r.PathValue("fileName"))
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			if size > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			}
 			w.WriteHeader(http.StatusOK)
-			_, err := wt.WriteTo(w)
+			_, err := io.Copy(w, rdr)
 			return err
 		})
 		if err != nil {
 			log.Err(err).Msg("Failed to do media proxy with temp file")
 			if !responseStarted {
-				var mautrixRespError mautrix.RespError
-				if errors.As(err, &mautrixRespError) {
+				if mautrixRespError, ok := errors.AsType[mautrix.RespError](err); ok {
 					mautrixRespError.Write(w)
 				} else {
 					mautrix.MUnknown.WithMessage("Internal error proxying media").Write(w)
@@ -461,7 +522,7 @@ func (mp *MediaProxy) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 func doTempFileDownload(
 	data *GetMediaResponseFile,
-	respond func(w io.WriterTo, size int64, mimeType string) error,
+	respond func(r io.Reader, size int64, mimeType string) error,
 ) (bool, error) {
 	tempFile, err := os.CreateTemp("", "mautrix-mediaproxy-*")
 	if err != nil {
@@ -476,6 +537,9 @@ func doTempFileDownload(
 	if err != nil {
 		return false, err
 	}
+	if meta == nil {
+		meta = &FileMeta{}
+	}
 	if meta.ReplacementFile != "" {
 		tempFile, err = os.Open(meta.ReplacementFile)
 		if err != nil {
@@ -483,7 +547,7 @@ func doTempFileDownload(
 		}
 		defer func() {
 			_ = tempFile.Close()
-			_ = os.Remove(origTempFile.Name())
+			_ = os.Remove(tempFile.Name())
 		}()
 	} else {
 		_, err = tempFile.Seek(0, io.SeekStart)
@@ -509,7 +573,17 @@ func doTempFileDownload(
 		}
 		mimeType = http.DetectContentType(buf)
 	}
-	err = respond(tempFile, fileInfo.Size(), mimeType)
+	size := fileInfo.Size()
+	var reader io.Reader = tempFile
+	if data.Encryption != nil {
+		encrypter := data.Encryption.EncryptStream(reader)
+		defer func() {
+			_ = encrypter.Close()
+		}()
+		reader = encrypter
+		size = data.Encryption.EncryptedLength(size)
+	}
+	err = respond(reader, size, mimeType)
 	if err != nil {
 		return true, fmt.Errorf("failed to write response: %w", err)
 	}

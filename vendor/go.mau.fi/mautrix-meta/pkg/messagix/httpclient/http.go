@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -34,11 +36,16 @@ type HTTPClient struct {
 
 	HTTP            *http.Client
 	HTTPSettings    exhttp.ClientSettings
+	ownedTransport  *req.Transport
+	uploadHTTP      *http.Client
+	lsSyncHTTP      *http.Client
 	websocketClient *http.Client
 	proxyAddr       string
+	proxyLock       sync.Mutex
 	GetNewProxy     func(reason string) (string, error)
+	instagramNative atomic.Bool
 
-	LogRedactedBloksPayloads bool
+	LogRedactedLoginResponses bool
 }
 
 type Client interface {
@@ -68,6 +75,25 @@ func (c *HTTPClient) SetConfigs(configs *Configs) {
 	c.configs = configs
 }
 
+func (c *HTTPClient) SetInstagramNativeMode(native bool) {
+	if c.instagramNative.Swap(native) != native {
+		c.SetConfig(c.HTTPSettings)
+	}
+}
+
+func (c *HTTPClient) SetTransportOverride(transport http.RoundTripper) {
+	c.HTTP.Timeout = 0
+	if transport == nil {
+		transport = c.ownedTransport
+		c.HTTP.Timeout = c.HTTPSettings.GlobalTimeout
+	}
+	c.HTTP.Transport = transport
+}
+
+func (c *HTTPClient) GetHTTPClient() *http.Client {
+	return c.HTTP
+}
+
 func (c *HTTPClient) SetConfig(settings exhttp.ClientSettings) {
 	if c == nil {
 		return
@@ -78,24 +104,42 @@ func (c *HTTPClient) SetConfig(settings exhttp.ClientSettings) {
 	if c.proxyAddr != "" {
 		c.HTTPSettings, _ = c.HTTPSettings.WithProxy(c.proxyAddr)
 	}
-	reqClient := req.C().ImpersonateChrome()
+	reqClient := c.newReqClient()
+	uploadReqClient := c.newReqClient()
+	lsSyncReqClient := c.newReqClient()
 	wsClient := req.C().ImpersonateChrome()
 	forceHTTP1ChromeFingerprint(wsClient)
 	if DisableTLSVerification {
-		reqClient.SetTLSClientConfig(&tls.Config{
-			InsecureSkipVerify: true,
-		})
 		wsClient.SetTLSClientConfig(&tls.Config{
 			InsecureSkipVerify: true,
 		})
 	}
 
 	oldHTTP := c.HTTP
+	oldTransport := c.ownedTransport
+	oldUploadHTTP := c.uploadHTTP
+	oldLSSyncHTTP := c.lsSyncHTTP
 	c.websocketClient = req.WithTransportOverride(c.HTTPSettings.WithGlobalTimeout(WebsocketHandshakeTimeout), wsClient).Compile()
 	c.HTTP = req.WithTransportOverride(c.HTTPSettings, reqClient).Compile()
+	c.ownedTransport = reqClient.GetTransport()
+	uploadSettings := c.HTTPSettings.WithGlobalTimeout(MediaUploadTimeout).WithResponseHeaderTimeout(MediaUploadTimeout)
+	c.uploadHTTP = req.WithTransportOverride(uploadSettings, uploadReqClient).Compile()
+	c.uploadHTTP.CheckRedirect = c.checkHTTPRedirect
+	lsSyncSettings := c.HTTPSettings.WithGlobalTimeout(LightspeedSyncTimeout).WithResponseHeaderTimeout(LightspeedSyncHeaderTimeout)
+	c.lsSyncHTTP = req.WithTransportOverride(lsSyncSettings, lsSyncReqClient).Compile()
+	c.lsSyncHTTP.CheckRedirect = c.checkHTTPRedirect
 	c.HTTP.CheckRedirect = c.checkHTTPRedirect
-	if oldHTTP != nil {
-		oldHTTP.CloseIdleConnections()
+	if oldHTTP != nil && oldHTTP.Transport != oldTransport {
+		c.SetTransportOverride(oldHTTP.Transport)
+	}
+	if oldTransport != nil {
+		oldTransport.CloseIdleConnections()
+	}
+	if oldUploadHTTP != nil {
+		oldUploadHTTP.CloseIdleConnections()
+	}
+	if oldLSSyncHTTP != nil {
+		oldLSSyncHTTP.CloseIdleConnections()
 	}
 
 	if DisableTLSVerification {
@@ -160,6 +204,36 @@ func forceHTTP1ChromeFingerprint(c *req.Client) {
 	})
 }
 
+func (c *HTTPClient) newReqClient() *req.Client {
+	reqClient := req.C()
+	if DisableTLSVerification {
+		reqClient.SetTLSClientConfig(&tls.Config{
+			InsecureSkipVerify: true,
+		})
+	}
+	if c.parent.GetPlatform().IsInstagram() && c.instagramNative.Load() {
+		reqClient.ImpersonateInstagramAndroid().
+			SetHTTP2ReadIdleTimeout(15 * time.Second)
+	} else {
+		reqClient.ImpersonateChrome()
+	}
+	return reqClient
+}
+
+func (c *HTTPClient) uploadClient() *http.Client {
+	if c.HTTP.Transport != c.ownedTransport {
+		return c.HTTP
+	}
+	return c.uploadHTTP
+}
+
+func (c *HTTPClient) lsSyncClient() *http.Client {
+	if c.HTTP.Transport != c.ownedTransport {
+		return c.HTTP
+	}
+	return c.lsSyncHTTP
+}
+
 func (c *HTTPClient) SetProxy(proxyAddr string) error {
 	if c == nil {
 		return nil
@@ -193,8 +267,33 @@ func (c *HTTPClient) UpdateProxy(reason string) bool {
 	return true
 }
 
+func (c *HTTPClient) changeProxyAfter(prevProxy, reason string) bool {
+	if c.GetNewProxy == nil {
+		return false
+	}
+	c.proxyLock.Lock()
+	defer c.proxyLock.Unlock()
+	if c.proxyAddr != prevProxy {
+		return true
+	}
+	proxyAddr, err := c.GetNewProxy(reason)
+	if err != nil {
+		c.log.Err(err).Str("reason", reason).Msg("Failed to get new proxy")
+		return false
+	} else if proxyAddr == prevProxy {
+		return false
+	} else if err = c.SetProxy(proxyAddr); err != nil {
+		c.log.Err(err).Str("reason", reason).Msg("Failed to set new proxy")
+		return false
+	}
+	return true
+}
+
 var DisableTLSVerification = false
 var WebsocketHandshakeTimeout = 20 * time.Second
+var MediaUploadTimeout = 5 * time.Minute
+var LightspeedSyncHeaderTimeout = 60 * time.Second
+var LightspeedSyncTimeout = 90 * time.Second
 
 func (c *HTTPClient) GetWebsocketDialer() *websocket.DialOptions {
 	if c == nil {
@@ -316,11 +415,45 @@ var (
 	ErrResponseReadFailed       = errors.New("failed to read response body")
 	ErrResponseTooLarge         = fmt.Errorf("response body exceeds %d byte limit", MaxResponseBodyBytes)
 	ErrUnexpectedError          = errors.New("server returned unexpected HTTP status")
+	ErrRateLimited              = fmt.Errorf("%w 429", ErrUnexpectedError)
+	ErrPageInternalServerError  = errors.New("page returned internal server error")
 	ErrMaxRetriesReached        = errors.New("maximum retries reached")
 	ErrTooManyRedirects         = errors.New("too many redirects")
 	ErrUserIDIsZero             = fmt.Errorf("%w: user id in initial data is zero", ErrTokenInvalidated)
 	ErrVersionIDNotFound        = errors.New("version ID not found")
 )
+
+type RedirectedError struct {
+	Type error
+	URL  string
+}
+
+func (re RedirectedError) Error() string {
+	if errors.Is(re.Type, ErrChallengeRequired) || errors.Is(re.Type, ErrCheckpointRequired) {
+		return fmt.Sprintf("%v: redirected", re.Type)
+	}
+	return fmt.Sprintf("%v: redirected to %s", re.Type, re.URL)
+}
+
+func (re RedirectedError) Unwrap() error {
+	return re.Type
+}
+
+func GetErrorRedirectURL(err error) string {
+	if re, ok := errors.AsType[RedirectedError](err); ok {
+		return re.URL
+	}
+	return ""
+}
+
+func accountVerificationPath(path string) (challenge, checkpoint bool) {
+	path = "/" + strings.Trim(path, "/") + "/"
+	challenge = strings.Contains(path, "/challenge/") ||
+		strings.Contains(path, "/auth_platform/") ||
+		path == "/accounts/scraping_warning/" ||
+		path == "/accounts/update_risky_contactpoint/"
+	return challenge, strings.Contains(path, "/checkpoint/")
+}
 
 func IsPermanentRequestError(err error) bool {
 	return errors.Is(err, ErrTokenInvalidated) ||
@@ -328,6 +461,7 @@ func IsPermanentRequestError(err error) bool {
 		errors.Is(err, ErrCheckpointRequired) ||
 		errors.Is(err, ErrConsentRequired) ||
 		errors.Is(err, ErrAccountSuspended) ||
+		errors.Is(err, ErrRateLimited) ||
 		errors.Is(err, ErrTooManyRedirects) ||
 		errors.Is(err, ErrResponseTooLarge)
 }
@@ -339,24 +473,34 @@ func (c *HTTPClient) checkHTTPRedirect(req *http.Request, via []*http.Request) e
 	if len(via) > 5 {
 		return ErrTooManyRedirects
 	}
+	challengeRedirect, checkpointRedirect := accountVerificationPath(req.URL.Path)
 	if !strings.HasSuffix(req.URL.Hostname(), "fbcdn.net") && !strings.HasSuffix(req.URL.Hostname(), "facebookcooa4ldbat4g7iacswl3p2zrf5nuylvnhxn6kqolvojixwid.onion") {
-		var prevURL string
-		if len(via) > 0 {
-			prevURL = via[len(via)-1].URL.String()
+		logEvent := c.log.Warn()
+		if challengeRedirect || checkpointRedirect {
+			logEvent = logEvent.Str("redirect_type", "account_verification")
+		} else {
+			var prevURL string
+			if len(via) > 0 {
+				previous := via[len(via)-1].URL
+				previousChallenge, previousCheckpoint := accountVerificationPath(previous.Path)
+				if previousChallenge || previousCheckpoint {
+					prevURL = "account_verification"
+				} else {
+					prevURL = previous.String()
+				}
+			}
+			logEvent = logEvent.Stringer("url", req.URL).Str("prev_url", prevURL)
 		}
-		c.log.Warn().
-			Stringer("url", req.URL).
-			Str("prev_url", prevURL).
-			Msg("HTTP request was redirected")
+		logEvent.Msg("HTTP request was redirected")
 	}
-	if strings.HasPrefix(req.URL.Path, "/challenge/") {
-		return fmt.Errorf("%w: redirected to %s", ErrChallengeRequired, req.URL.String())
+	if challengeRedirect {
+		return RedirectedError{Type: ErrChallengeRequired, URL: req.URL.String()}
 	} else if req.URL.Path == "/accounts/suspended/" {
-		return fmt.Errorf("%w: redirected to %s", ErrAccountSuspended, req.URL.String())
+		return RedirectedError{Type: ErrAccountSuspended, URL: req.URL.String()}
 	} else if req.URL.Path == "/consent/" || strings.HasPrefix(req.URL.Path, "/privacy/consent/") {
-		return fmt.Errorf("%w: redirected to %s", ErrConsentRequired, req.URL.String())
-	} else if strings.HasPrefix(req.URL.Path, "/checkpoint/") {
-		return fmt.Errorf("%w: redirected to %s", ErrCheckpointRequired, req.URL.String())
+		return RedirectedError{Type: ErrConsentRequired, URL: req.URL.String()}
+	} else if checkpointRedirect {
+		return RedirectedError{Type: ErrCheckpointRequired, URL: req.URL.String()}
 	}
 	respCookies := req.Response.Cookies()
 	for _, cookie := range respCookies {
@@ -378,18 +522,22 @@ func (c *HTTPClient) MakeRequest(
 	payload []byte,
 	contentType types.ContentType,
 ) (*http.Response, []byte, error) {
-	return c.makeRequest(ctx, url, method, headers, payload, contentType, func(e *zerolog.Event) *zerolog.Event {
+	return c.makeRequest(ctx, c.GetHTTPClient, url, method, headers, payload, contentType, func(e *zerolog.Event) *zerolog.Event {
 		return e
 	})
 }
 
+func IsClientHTTPError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "error from client: ")
+}
+
 func isClientHTTP(resp *http.Response, err error) bool {
-	return (err != nil && strings.Contains(err.Error(), "error from client: ")) ||
-		(resp != nil && resp.Proto == "MauClientHTTP/1.0")
+	return IsClientHTTPError(err) || (resp != nil && resp.Proto == "MauClientHTTP/1.0")
 }
 
 func (c *HTTPClient) makeRequest(
 	ctx context.Context,
+	getClient func() *http.Client,
 	url string,
 	method string,
 	headers http.Header,
@@ -398,10 +546,12 @@ func (c *HTTPClient) makeRequest(
 	logContext func(e *zerolog.Event) *zerolog.Event,
 ) (*http.Response, []byte, error) {
 	var attempts int
+	var changedProxy bool
 	for {
 		attempts++
 		start := time.Now()
-		resp, respDat, err := c.makeRequestDirect(ctx, url, method, headers, payload, contentType)
+		proxyAddr := c.proxyAddr
+		resp, respDat, err := c.makeRequestOnce(ctx, getClient(), url, method, headers, payload, contentType)
 		dur := time.Since(start)
 		if err == nil {
 			logContext(c.log.Debug()).
@@ -411,6 +561,14 @@ func (c *HTTPClient) makeRequest(
 				Int("status_code", resp.StatusCode).
 				Msg("Request successful")
 			return resp, respDat, nil
+		} else if errors.Is(err, ErrRateLimited) && !changedProxy && !isClientHTTP(resp, err) && c.changeProxyAfter(proxyAddr, "rate_limited") {
+			changedProxy = true
+			logContext(c.log.Warn().Err(err)).
+				Str("url", url).
+				Str("method", method).
+				Dur("duration", dur).
+				Msg("Request rate limited, retrying with new proxy")
+			continue
 		} else if attempts > MaxHTTPRetries {
 			logContext(c.log.Err(err)).
 				Str("url", url).
@@ -447,8 +605,22 @@ func (c *HTTPClient) makeRequest(
 	}
 }
 
-func (c *HTTPClient) makeRequestDirect(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
-	newRequest, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(payload))
+func (c *HTTPClient) MakeRequestOnce(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	return c.makeRequestOnce(ctx, c.HTTP, url, method, headers, payload, contentType)
+}
+
+// MakeRequestOnceNoRedirect returns the first response so callers can persist
+// cookies before deciding whether a redirect target is safe to follow.
+func (c *HTTPClient) MakeRequestOnceNoRedirect(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	httpClient := *c.HTTP
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return c.makeRequestOnce(ctx, &httpClient, url, method, headers, payload, contentType)
+}
+
+func (c *HTTPClient) makeRequestOnce(ctx context.Context, httpClient *http.Client, requestURL string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	newRequest, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -459,20 +631,33 @@ func (c *HTTPClient) makeRequestDirect(ctx context.Context, url string, method s
 
 	newRequest.Header = headers
 
-	response, err := c.HTTP.Do(newRequest)
+	response, err := httpClient.Do(newRequest)
 	defer func() {
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 	}()
 	if err != nil {
+		if response != nil && (errors.Is(err, ErrChallengeRequired) || errors.Is(err, ErrCheckpointRequired)) {
+			// Keep checkpoint cookies without rotating the proxy. http.Client.Do
+			// wraps the redirect error with a URL that may contain private tokens.
+			return response, nil, errors.Unwrap(err)
+		}
+		challengePath, checkpointPath := accountVerificationPath(newRequest.URL.Path)
+		if challengePath || checkpointPath {
+			err = errors.Unwrap(err)
+		}
 		c.UpdateProxy(fmt.Sprintf("http request error: %v", err.Error()))
 		return nil, nil, fmt.Errorf("%w: %w", ErrRequestFailed, err)
 	}
-
-	responseBody, err := ReadResponseBody(response.Body)
-	if err != nil {
-		return response, nil, fmt.Errorf("%w: %w", ErrResponseReadFailed, err)
+	responseBody, readErr := ReadResponseBody(response.Body)
+	if errors.Is(readErr, ErrResponseTooLarge) {
+		return response, nil, fmt.Errorf("%w: %w", ErrResponseReadFailed, readErr)
+	}
+	if response.StatusCode == http.StatusTooManyRequests {
+		return response, responseBody, ErrRateLimited
+	} else if readErr != nil {
+		return response, nil, fmt.Errorf("%w: %w", ErrResponseReadFailed, readErr)
 	}
 
 	if response.StatusCode >= 400 {
@@ -500,7 +685,23 @@ func ReadResponseBody(body io.Reader) ([]byte, error) {
 func (c *HTTPClient) fetchPageData(ctx context.Context, page string) ([]byte, error) {
 	headers := c.BuildHeaders(true, true)
 	//headers.Set("host", m.client.getEndpoint("host"))
-	_, responseBody, err := c.MakeRequest(ctx, page, "GET", headers, nil, types.NONE)
+	response, responseBody, err := c.makeRequest(ctx, c.GetHTTPClient, page, "GET", headers, nil, types.NONE, func(e *zerolog.Event) *zerolog.Event {
+		return e.Strs("cookie_names", c.parent.GetCookies().GetNames())
+	})
+	if response != nil {
+		c.parent.GetCookies().UpdateFromResponse(response)
+		if err != nil && c.LogRedactedLoginResponses {
+			evt := c.log.Debug().
+				Str("url", page).
+				Int("status_code", response.StatusCode).
+				Str("content_type", response.Header.Get("content-type")).
+				Strs("cookie_names", c.parent.GetCookies().GetNames())
+			AddRedactedResponse(evt, responseBody).Msg("Page request failed")
+		}
+		if errors.Is(err, ErrUnexpectedError) && response.StatusCode == http.StatusInternalServerError {
+			err = fmt.Errorf("%w: %w", ErrPageInternalServerError, err)
+		}
+	}
 	return responseBody, err
 }
 
@@ -565,8 +766,8 @@ func (c *HTTPClient) addInstagramHeaders(h *http.Header) {
 	}
 
 	if c.configs.BrowserConfigTable != nil {
-		if c.parent.GetCookies().IGWWWClaim != "" {
-			h.Set("x-ig-www-claim", c.parent.GetCookies().IGWWWClaim)
+		if wwwClaim := c.parent.GetCookies().GetWWWClaim(); wwwClaim != "" {
+			h.Set("x-ig-www-claim", wwwClaim)
 		}
 		h.Set("x-ig-app-id", c.configs.BrowserConfigTable.CurrentUserInitialData.AppID)
 	}

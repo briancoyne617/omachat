@@ -34,6 +34,10 @@ var ErrResolveIdentifierTryNext = errors.New("that identifier is not available v
 
 var ErrNotLoggedIn = errors.New("not logged in")
 
+// ErrLoginChangedConcurrently is returned by [User.NewLogin] if the existing login was replaced,
+// deleted or created by something else while its old client was being disconnected.
+var ErrLoginChangedConcurrently = errors.New("login was changed concurrently, please try again")
+
 // ErrDirectMediaNotEnabled may be returned by Matrix connectors if [MatrixConnector.GenerateContentURI] is called,
 // but direct media is not enabled.
 var ErrDirectMediaNotEnabled = errors.New("direct media is not enabled")
@@ -51,14 +55,15 @@ var (
 	ErrIgnoringPollFromRelayedUser      error = WrapErrorInStatus(errors.New("ignoring poll event from relayed user")).WithIsCertain(true).WithSendNotice(false)
 	ErrIgnoringDeleteChatRelayedUser    error = WrapErrorInStatus(errors.New("ignoring delete chat event from relayed user")).WithIsCertain(true).WithSendNotice(false)
 	ErrIgnoringAcceptRequestRelayedUser error = WrapErrorInStatus(errors.New("ignoring accept message request event from relayed user")).WithIsCertain(true).WithSendNotice(false)
+	ErrIgnoringBlockUserRelayedUser     error = WrapErrorInStatus(errors.New("ignoring block user request event from relayed user")).WithIsCertain(true).WithSendNotice(false)
 	ErrEditsNotSupported                error = WrapErrorInStatus(errors.New("this bridge does not support edits")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
 	ErrEditsNotSupportedInPortal        error = WrapErrorInStatus(errors.New("edits are not allowed in this chat")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
-	ErrCaptionsNotAllowed               error = WrapErrorInStatus(errors.New("captions are not supported here")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
-	ErrLocationMessagesNotAllowed       error = WrapErrorInStatus(errors.New("location messages are not supported here")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
+	ErrCaptionsNotAllowed               error = WrapErrorInStatus(errors.New("captions are not supported here")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported).WithSendNotice(true)
+	ErrLocationMessagesNotAllowed       error = WrapErrorInStatus(errors.New("location messages are not supported here")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported).WithSendNotice(true)
 	ErrEditTargetTooOld                 error = WrapErrorInStatus(errors.New("the message is too old to be edited")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
 	ErrEditTargetTooManyEdits           error = WrapErrorInStatus(errors.New("the message has been edited too many times")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
 	ErrReactionsNotSupported            error = WrapErrorInStatus(errors.New("this bridge does not support reactions")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
-	ErrPollsNotSupported                error = WrapErrorInStatus(errors.New("this bridge does not support polls")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
+	ErrPollsNotSupported                error = WrapErrorInStatus(errors.New("this bridge does not support polls")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported).WithSendNotice(true)
 	ErrUnknownPoll                      error = WrapErrorInStatus(errors.New("vote target poll not found")).WithIsCertain(true).WithErrorAsMessage().WithErrorReason(event.MessageStatusUnsupported)
 	ErrRoomMetadataNotSupported         error = WrapErrorInStatus(errors.New("this bridge does not support changing room metadata")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
 	ErrRoomMetadataNotAllowed           error = WrapErrorInStatus(errors.New("changes are not allowed here")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
@@ -69,6 +74,7 @@ var (
 	ErrTargetMessageNotFound            error = WrapErrorInStatus(errors.New("target message not found")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(false)
 	ErrUnsupportedMessageType           error = WrapErrorInStatus(errors.New("unsupported message type")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
 	ErrUnsupportedMediaType             error = WrapErrorInStatus(errors.New("unsupported media type")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
+	ErrUnsupportedViewLimitedType       error = WrapErrorInStatus(errors.New("unsupported view-limited type")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
 	ErrMediaDurationTooLong             error = WrapErrorInStatus(errors.New("media duration too long")).WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
 	ErrVoiceMessageDurationTooLong      error = WrapErrorInStatus(errors.New("voice message too long")).WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
 	ErrMediaTooLarge                    error = WrapErrorInStatus(errors.New("media too large")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
@@ -78,6 +84,9 @@ var (
 	ErrMediaConvertFailed               error = WrapErrorInStatus(errors.New("failed to convert media")).WithMessage("failed to convert media").WithIsCertain(true).WithSendNotice(true)
 	ErrMembershipNotSupported           error = WrapErrorInStatus(errors.New("this bridge does not support changing group membership")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
 	ErrDeleteChatNotSupported           error = WrapErrorInStatus(errors.New("this bridge does not support deleting chats")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
+	ErrAcceptMessageRequestNotSupported error = WrapErrorInStatus(errors.New("this bridge does not support accepting message requests")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
+	ErrBlockUserNotSupported            error = WrapErrorInStatus(errors.New("this bridge does not support blocking users")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
+	ErrNonDMBlockUser                   error = WrapErrorInStatus(errors.New("blocking users can only be done in DMs")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
 	ErrPowerLevelsNotSupported          error = WrapErrorInStatus(errors.New("this bridge does not support changing group power levels")).WithIsCertain(true).WithErrorAsMessage().WithSendNotice(false).WithErrorReason(event.MessageStatusUnsupported)
 	ErrRemoteEchoTimeout                      = WrapErrorInStatus(errors.New("remote echo timed out")).WithIsCertain(false).WithSendNotice(true).WithErrorReason(event.MessageStatusTooOld)
 	ErrRemoteAckTimeout                       = WrapErrorInStatus(errors.New("remote ack timed out")).WithIsCertain(false).WithSendNotice(true).WithErrorReason(event.MessageStatusTooOld)
@@ -109,11 +118,18 @@ func (re RespError) Error() string {
 }
 
 func (re RespError) Is(err error) bool {
-	var e2 RespError
-	if errors.As(err, &e2) {
+	if e2, ok := errors.AsType[RespError](err); ok {
 		return e2.Err == re.Err
 	}
 	return errors.Is(err, mautrix.RespError(re))
+}
+
+func (re RespError) As(target any) bool {
+	if ptr, ok := target.(*mautrix.RespError); ok {
+		*ptr = mautrix.RespError(re)
+		return true
+	}
+	return false
 }
 
 func (re RespError) Write(w http.ResponseWriter) {

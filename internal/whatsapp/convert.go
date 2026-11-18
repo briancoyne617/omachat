@@ -300,7 +300,7 @@ func convertEventMessage(evt *events.Message) (wire.Message, bool) {
 }
 
 func isStatusUpdate(info types.MessageInfo) bool {
-	return info.IsNewsletterStatus || info.Chat == types.StatusBroadcastJID
+	return info.StanzaTag == "status" || info.Chat == types.StatusBroadcastJID
 }
 
 // formatConversationName resolves a friendly chat name from a JID and available contact/push name.

@@ -88,12 +88,31 @@ const (
 	upsertDisappearingMessageQuery = `
 		INSERT INTO disappearing_message (bridge_id, mx_room, mxid, timestamp, type, timer, disappear_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (bridge_id, mxid) DO UPDATE SET timer=excluded.timer, disappear_at=excluded.disappear_at
+		ON CONFLICT (bridge_id, mxid) DO UPDATE SET
+			timer=excluded.timer,
+			type=CASE WHEN excluded.type='view_limited' THEN excluded.type ELSE disappearing_message.type END,
+			disappear_at=CASE
+				WHEN (excluded.type='view_limited' OR disappearing_message.type='view_limited')
+					AND disappearing_message.disappear_at IS NOT NULL
+					AND (excluded.disappear_at IS NULL OR disappearing_message.disappear_at<=excluded.disappear_at)
+				THEN disappearing_message.disappear_at
+				ELSE excluded.disappear_at END
 	`
 	startDisappearingMessagesQuery = `
 		UPDATE disappearing_message
 		SET disappear_at=$1 + timer
 		WHERE bridge_id=$2 AND mx_room=$3 AND disappear_at IS NULL AND type='after_read' AND timestamp<=$4
+		RETURNING bridge_id, mx_room, mxid, timestamp, type, timer, disappear_at
+	`
+	startRecipientReadDisappearingMessagesQuery = `
+		UPDATE disappearing_message
+		SET disappear_at=$1 + timer
+		WHERE bridge_id=$2 AND mx_room=$3 AND disappear_at IS NULL AND type='after_read_by_recipient' AND timestamp<=$4
+		AND EXISTS (
+			SELECT 1 FROM message
+			WHERE message.bridge_id=disappearing_message.bridge_id AND message.mxid=disappearing_message.mxid
+			AND (message.sender_id=$5)=$6
+		)
 		RETURNING bridge_id, mx_room, mxid, timestamp, type, timer, disappear_at
 	`
 	getUpcomingDisappearingMessagesQuery = `
@@ -113,6 +132,10 @@ func (dmq *DisappearingMessageQuery) Put(ctx context.Context, dm *DisappearingMe
 
 func (dmq *DisappearingMessageQuery) StartAllBefore(ctx context.Context, roomID id.RoomID, beforeTS time.Time) ([]*DisappearingMessage, error) {
 	return dmq.QueryMany(ctx, startDisappearingMessagesQuery, time.Now().UnixNano(), dmq.BridgeID, roomID, beforeTS.UnixNano())
+}
+
+func (dmq *DisappearingMessageQuery) StartAllBeforeFrom(ctx context.Context, roomID id.RoomID, beforeTS, startTS time.Time, senderID networkid.UserID, matchesSender bool) ([]*DisappearingMessage, error) {
+	return dmq.QueryMany(ctx, startRecipientReadDisappearingMessagesQuery, startTS.UnixNano(), dmq.BridgeID, roomID, beforeTS.UnixNano(), senderID, matchesSender)
 }
 
 func (dmq *DisappearingMessageQuery) GetUpcoming(ctx context.Context, duration time.Duration, limit int) ([]*DisappearingMessage, error) {

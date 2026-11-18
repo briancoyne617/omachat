@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -128,6 +129,10 @@ type Transport struct {
 
 	// Force using specific http version
 	forceHttpVersion httpVersion
+
+	// rejectProxyWithSetHosts prevents proxy-side DNS from bypassing the
+	// fail-closed static host mapping installed by Client.SetHosts.
+	rejectProxyWithSetHosts bool
 
 	transport.Options
 
@@ -441,6 +446,22 @@ func (t *Transport) SetHTTP2PriorityFrames(frames ...http2.PriorityFrame) *Trans
 	return t
 }
 
+// SetHTTP2NextStreamID sets the stream ID of the first client-initiated
+// stream on new HTTP/2 connections (default 1). Some clients use a
+// different starting value (e.g. OkHttp starts at 3), which is part of
+// their HTTP/2 fingerprint. The value must be odd and fit into 31 bits
+// (RFC 9113); invalid values are ignored. If priority frames are also
+// configured (see SetHTTP2PriorityFrames), the counter advances past the
+// stream IDs they claim, so their stream IDs should be greater than or
+// equal to this value and given in increasing order.
+func (t *Transport) SetHTTP2NextStreamID(id uint32) *Transport {
+	if id%2 == 0 || id > math.MaxInt32 {
+		return t
+	}
+	t.t2.NextStreamID = id
+	return t
+}
+
 // SetTLSClientConfig set the custom TLSClientConfig, which specifies the TLS configuration to
 // use with tls.Client.
 // If nil, the default configuration is used.
@@ -461,8 +482,11 @@ func (t *Transport) SetDebug(debugf func(format string, v ...any)) *Transport {
 // is aborted with the provided error.
 //
 // The proxy type is determined by the URL scheme. "http",
-// "https", and "socks5" are supported. If the scheme is empty,
-// "http" is assumed.
+// "https", "socks5", "socks5h", "socks4", and "socks4a" are
+// supported. If the scheme is empty, "http" is assumed.
+// "socks5" is treated the same as "socks5h".
+// "socks4" resolves domain names locally to IPv4; "socks4a" lets the
+// proxy resolve domain names. SOCKS4 only supports IPv4 destinations.
 //
 // If Proxy is nil or returns a nil *URL, no proxy is used.
 func (t *Transport) SetProxy(proxy func(*http.Request) (*url.URL, error)) *Transport {
@@ -479,6 +503,7 @@ func (t *Transport) SetProxy(proxy func(*http.Request) (*url.URL, error)) *Trans
 // earlier connection becomes idle before the later dial function completes.
 func (t *Transport) SetDial(fn func(ctx context.Context, network, addr string) (net.Conn, error)) *Transport {
 	t.DialContext = fn
+	t.rejectProxyWithSetHosts = false
 	return t
 }
 
@@ -740,13 +765,14 @@ func (t *Transport) readBufferSize() int {
 // Clone returns a deep copy of t's exported fields.
 func (t *Transport) Clone() *Transport {
 	tt := &Transport{
-		Headers:               t.Headers.Clone(),
-		Cookies:               cloneSlice(t.Cookies),
-		Options:               t.Options.Clone(),
-		disableAutoDecode:     t.disableAutoDecode,
-		autoDecodeContentType: t.autoDecodeContentType,
-		forceHttpVersion:      t.forceHttpVersion,
-		httpRoundTripWrappers: t.httpRoundTripWrappers,
+		Headers:                 t.Headers.Clone(),
+		Cookies:                 cloneSlice(t.Cookies),
+		Options:                 t.Options.Clone(),
+		disableAutoDecode:       t.disableAutoDecode,
+		autoDecodeContentType:   t.autoDecodeContentType,
+		forceHttpVersion:        t.forceHttpVersion,
+		rejectProxyWithSetHosts: t.rejectProxyWithSetHosts,
+		httpRoundTripWrappers:   t.httpRoundTripWrappers,
 	}
 	if len(tt.httpRoundTripWrappers) > 0 { // clone transport middleware
 		fn := func(req *http.Request) (*http.Response, error) {
@@ -769,6 +795,7 @@ func (t *Transport) Clone() *Transport {
 			Settings:                   cloneSlice(t.t2.Settings),
 			HeaderPriority:             t.t2.HeaderPriority,
 			PriorityFrames:             cloneSlice(t.t2.PriorityFrames),
+			NextStreamID:               t.t2.NextStreamID,
 		}
 	}
 	if t.t3 != nil {
@@ -944,7 +971,7 @@ func (t *Transport) roundTrip(req *http.Request) (resp *http.Response, err error
 
 	if scheme == "https" && t.forceHttpVersion != h1 {
 		resp, err := t.t2.RoundTripOnlyCachedConn(req)
-		if err != h2internal.ErrNoCachedConn {
+		if err != h2internal.ErrNoCachedConn && !h2internal.CanRetryError(err) {
 			return resp, err
 		}
 		req, err = rewindBody(req)
@@ -1271,6 +1298,9 @@ func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectM
 	cm.targetAddr = canonicalAddr(treq.URL)
 	if t.Proxy != nil {
 		cm.proxyURL, err = t.Proxy(treq.Request)
+		if err == nil && cm.proxyURL != nil && t.rejectProxyWithSetHosts {
+			err = errors.New("req: SetHosts cannot be used with a proxy")
+		}
 	}
 	cm.onlyH1 = t.forceHttpVersion == h1 || requestRequiresHTTP1(treq.Request)
 	return cm, err
@@ -2157,6 +2187,18 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 			conn.Close()
 			return nil, err
 		}
+	case cm.proxyURL.Scheme == "socks4" || cm.proxyURL.Scheme == "socks4a":
+		conn := pconn.conn
+		d := socks.NewDialer("tcp", conn.RemoteAddr().String())
+		d.Version = socks.Version4
+		d.Socks4A = cm.proxyURL.Scheme == "socks4a"
+		if u := cm.proxyURL.User; u != nil {
+			d.UserID = u.Username()
+		}
+		if _, err := d.DialWithConn(ctx, conn, "tcp", cm.targetAddr); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	case cm.targetScheme == "http":
 		pconn.isProxy = true
 		if pa := cm.proxyAuth(); pa != "" {
@@ -2319,6 +2361,8 @@ var _ io.ReaderFrom = (*persistConnWriter)(nil)
 //	http://proxy.com|http             http to proxy, http to anywhere after that
 //	socks5://proxy.com|http|foo.com   socks5 to proxy, then http to foo.com
 //	socks5://proxy.com|https|foo.com  socks5 to proxy, then https to foo.com
+//	socks4://proxy.com|http|foo.com   socks4 to proxy, then http to foo.com
+//	socks4a://proxy.com|https|foo.com socks4a to proxy, then https to foo.com
 //	https://proxy.com|https|foo.com   https to proxy, then CONNECT to foo.com
 //	https://proxy.com|http            https to proxy, http to anywhere after that
 type connectMethod struct {
@@ -2349,7 +2393,7 @@ func (cm *connectMethod) key() connectMethodKey {
 	}
 }
 
-// scheme returns the first hop scheme: http, https, or socks5
+// scheme returns the first hop scheme: http, https, socks5, socks5h, socks4, or socks4a
 func (cm *connectMethod) scheme() string {
 	if cm.proxyURL != nil {
 		return cm.proxyURL.Scheme
@@ -3573,6 +3617,8 @@ var portMap = map[string]string{
 	"https":   "443",
 	"socks5":  "1080",
 	"socks5h": "1080",
+	"socks4":  "1080",
+	"socks4a": "1080",
 }
 
 func idnaASCIIFromURL(url *url.URL) string {

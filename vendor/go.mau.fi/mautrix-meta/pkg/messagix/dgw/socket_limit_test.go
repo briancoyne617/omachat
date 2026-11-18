@@ -161,11 +161,11 @@ func TestSocketIncomingMessageLimit(t *testing.T) {
 						HTTPClient:      &http.Client{Transport: transport},
 					},
 				})
-				socket.OnConnect = func(context.Context) error {
+				socket.OnConnect = func(context.Context, func(error)) error {
 					stream = newStream(socket.conn.Load(), 1, func(_ context.Context, payload []byte) error {
 						delivered <- len(payload)
 						return nil
-					}, zerolog.Nop())
+					}, nil, zerolog.Nop())
 					socket.streams.Set(1, stream)
 					close(ready)
 					return nil

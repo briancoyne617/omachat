@@ -73,7 +73,28 @@ const (
 	deleteUserPortalQuery = `
 		DELETE FROM user_portal WHERE bridge_id=$1 AND user_mxid=$2 AND login_id=$3 AND portal_id=$4 AND portal_receiver=$5
 	`
+	deleteNonReceiverUserPortalsQuery = `
+		DELETE FROM user_portal WHERE bridge_id=$1 AND portal_receiver<>'' AND login_id<>portal_receiver
+	`
+	getNonReceiverSpaceChildrenQuery = `
+		SELECT ul.space_room, p.mxid
+		FROM user_portal up
+		JOIN user_login ul ON ul.bridge_id=up.bridge_id AND ul.id=up.login_id
+		JOIN portal p ON p.bridge_id=up.bridge_id AND p.id=up.portal_id AND p.receiver=up.portal_receiver
+		WHERE up.bridge_id=$1 AND up.portal_receiver<>'' AND up.login_id<>up.portal_receiver AND up.in_space
+			AND ul.space_room<>'' AND p.mxid<>''
+	`
 )
+
+type SpaceChild struct {
+	SpaceRoom id.RoomID
+	ChildRoom id.RoomID
+}
+
+var spaceChildScanner = dbutil.ConvertRowFn[SpaceChild](func(row dbutil.Scannable) (sc SpaceChild, err error) {
+	err = row.Scan(&sc.SpaceRoom, &sc.ChildRoom)
+	return
+})
 
 func UserPortalFor(ul *UserLogin, portal networkid.PortalKey) *UserPortal {
 	return &UserPortal{
@@ -119,6 +140,18 @@ func (upq *UserPortalQuery) MarkAllNotInSpace(ctx context.Context, portal networ
 
 func (upq *UserPortalQuery) Delete(ctx context.Context, up *UserPortal) error {
 	return upq.Exec(ctx, deleteUserPortalQuery, up.BridgeID, up.UserMXID, up.LoginID, up.Portal.ID, up.Portal.Receiver)
+}
+
+func (upq *UserPortalQuery) DeleteNonReceiverAfterSplitPortalMigration(ctx context.Context) (int64, error) {
+	res, err := upq.GetDB().Exec(ctx, deleteNonReceiverUserPortalsQuery, upq.BridgeID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (upq *UserPortalQuery) GetNonReceiverSpaceChildren(ctx context.Context) ([]SpaceChild, error) {
+	return spaceChildScanner.NewRowIter(upq.GetDB().Query(ctx, getNonReceiverSpaceChildrenQuery, upq.BridgeID)).AsList()
 }
 
 func (up *UserPortal) Scan(row dbutil.Scannable) (*UserPortal, error) {

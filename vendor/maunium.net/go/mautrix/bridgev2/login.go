@@ -14,9 +14,20 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/rs/zerolog"
+
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 )
+
+// ErrLoginStepCancelled is used as the cancellation cause when the user goes
+// back from a cancellable login step. It does not mean that the whole login
+// process was cancelled.
+var ErrLoginStepCancelled = RespError{
+	ErrCode:    "FI.MAU.LOGIN_STEP_CANCELLED",
+	Err:        "Login step was cancelled",
+	StatusCode: http.StatusConflict,
+}
 
 // LoginProcess represents a single occurrence of a user logging into the remote network.
 type LoginProcess interface {
@@ -45,9 +56,15 @@ type LoginProcessWithOverride interface {
 	StartWithOverride(ctx context.Context, override *UserLogin) (*LoginStep, error)
 }
 
+type FingerprintingRoundTripper interface {
+	http.RoundTripper
+	SetFingerprint(fingerprint string)
+}
+
 type LoginStartParams struct {
-	Override *UserLogin
-	HTTP     http.RoundTripper
+	Override      *UserLogin
+	HTTP          FingerprintingRoundTripper
+	WebSocketHTTP FingerprintingRoundTripper
 }
 
 type LoginProcessWithParams interface {
@@ -58,12 +75,24 @@ type LoginProcessWithParams interface {
 
 type LoginProcessDisplayAndWait interface {
 	LoginProcess
+	// Wait waits for the remote login flow to advance. When a step with
+	// CanCancel is cancelled through the provisioning API, ctx is cancelled and
+	// context.Cause(ctx) is ErrLoginStepCancelled. The implementation should
+	// stop waiting and return ErrLoginStepCancelled.
 	Wait(ctx context.Context) (*LoginStep, error)
 }
 
 type LoginProcessUserInput interface {
 	LoginProcess
 	SubmitUserInput(ctx context.Context, input map[string]string) (*LoginStep, error)
+}
+
+// LoginProcessStepCancel is implemented by login processes which return
+// cancellable steps. CancelStep should perform the back action and return the
+// step that the client should display next.
+type LoginProcessStepCancel interface {
+	LoginProcess
+	CancelStep(ctx context.Context) (*LoginStep, error)
 }
 
 type LoginProcessCookies interface {
@@ -127,20 +156,64 @@ type LoginStep struct {
 	CompleteParams       *LoginCompleteParams       `json:"complete,omitempty"`
 }
 
+func (ls *LoginStep) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("type", string(ls.Type)).
+		Str("step_id", ls.StepID).
+		Str("txn_id", ls.TxnID).
+		Str("instructions", ls.Instructions)
+	if ls.DisplayAndWaitParams != nil {
+		e.Any("display_and_wait", ls.DisplayAndWaitParams)
+	}
+	if ls.CookiesParams != nil {
+		e.Object("cookies", ls.CookiesParams)
+	}
+	if ls.ClientHTTPParams != nil {
+		e.Object("client_http", ls.ClientHTTPParams)
+	}
+	if ls.UserInputParams != nil {
+		e.Any("user_input", ls.UserInputParams)
+	}
+	if ls.WebAuthnParams != nil {
+		e.Any("webauthn", ls.WebAuthnParams)
+	}
+	if ls.CompleteParams != nil {
+		e.Any("complete", ls.CompleteParams)
+	}
+}
+
 type LoginClientHTTPParams struct {
 	RequestID string      `json:"request_id"`
+	StreamID  string      `json:"stream_id,omitempty"`
 	Method    string      `json:"method"`
 	URL       string      `json:"url"`
 	Headers   http.Header `json:"headers,omitempty"`
 	Body      []byte      `json:"body,omitempty"`
+
+	Fingerprint         string `json:"fingerprint,omitempty"`
+	AcceptsGzipResponse bool   `json:"accepts_gzip_response,omitzero"`
 }
 
+func (lchp *LoginClientHTTPParams) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("request_id", lchp.RequestID).
+		Str("method", lchp.Method).
+		Str("url", lchp.URL).
+		Int("header_count", len(lchp.Headers)).
+		Int("body_length", len(lchp.Body)).
+		Str("fingerprint", lchp.Fingerprint).
+		Bool("accepts_gzip_response", lchp.AcceptsGzipResponse)
+}
+
+const ClientHTTPResponseGzipContentType = "application/vnd.mautrix.client-http-response+gzip"
+
 type LoginClientHTTPResponse struct {
-	StatusCode int         `json:"status_code,omitempty"`
-	FinalURL   string      `json:"final_url,omitempty"`
-	Headers    http.Header `json:"headers,omitempty"`
-	Body       []byte      `json:"body,omitempty"`
-	Error      string      `json:"error,omitempty"`
+	StreamID    string      `json:"stream_id,omitempty"`
+	StatusCode  int         `json:"status_code,omitzero"`
+	FinalURL    string      `json:"final_url,omitempty"`
+	Headers     http.Header `json:"headers,omitempty"`
+	Trailers    http.Header `json:"trailers,omitempty"`
+	Body        []byte      `json:"body,omitempty"`
+	Error       string      `json:"error,omitempty"`
+	Fingerprint string      `json:"fingerprint,omitempty"`
 }
 
 func (lchr *LoginClientHTTPResponse) IsValid() bool {
@@ -167,6 +240,9 @@ type LoginDisplayAndWaitParams struct {
 	// An image containing the thing to display. If present, this is recommended over using data directly.
 	// For emojis, the URL to the canonical image representation of the emoji
 	ImageURL string `json:"image_url,omitempty"`
+	// If set, the client may allow the user to go back from this step. The
+	// context passed to Wait will be cancelled with ErrLoginStepCancelled.
+	CanCancel bool `json:"can_cancel,omitzero"`
 }
 
 type LoginCookieFieldSourceType string
@@ -206,10 +282,23 @@ type LoginCookieField struct {
 	Pattern string `json:"pattern,omitempty"`
 }
 
+type LoginCookie struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Domain string `json:"domain"`
+	// Path defaults to / if empty.
+	Path     string `json:"path,omitempty"`
+	Secure   bool   `json:"secure,omitzero"`
+	HTTPOnly bool   `json:"http_only,omitzero"`
+}
+
 type LoginCookiesParams struct {
 	URL       string `json:"url"`
 	UserAgent string `json:"user_agent,omitempty"`
 
+	// Cookies the client should set in the webview before loading the URL, used to continue a login
+	// session that was partially completed elsewhere (e.g. a captcha or checkpoint challenge).
+	InitialCookies []LoginCookie `json:"initial_cookies,omitempty"`
 	// The fields that are needed for this cookie login.
 	Fields []LoginCookieField `json:"fields"`
 	// A JavaScript snippet that can extract some or all of the fields.
@@ -222,9 +311,20 @@ type LoginCookiesParams struct {
 	// even if this URL is not reached, but it should only automatically close the webview after
 	// both cookies and the URL match.
 	WaitForURLPattern string `json:"wait_for_url_pattern,omitempty"`
-	// If set, the client should load the URL and run ExtractJS in a webview that is not shown to the
-	// user.
-	Hidden bool `json:"hidden,omitempty"`
+	// If true, the client should load the URL and run ExtractJS in a webview that is not shown to the user.
+	Hidden bool `json:"hidden,omitzero"`
+	// If true, running ExtractJS is mandatory. Clients that are unable to do so should fail the login.
+	JSRequired bool `json:"js_required,omitzero"`
+}
+
+func (lcp *LoginCookiesParams) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("url", lcp.URL).
+		Str("user_agent", lcp.UserAgent).
+		Int("initial_cookie_count", len(lcp.InitialCookies)).
+		Any("fields", lcp.Fields).
+		Str("extract_js", lcp.ExtractJS).
+		Str("wait_for_url_pattern", lcp.WaitForURLPattern).
+		Bool("hidden", lcp.Hidden)
 }
 
 type LoginInputFieldType string
@@ -253,8 +353,13 @@ type LoginInputDataField struct {
 	Description string `json:"description"`
 	// A default value that the client can pre-fill the field with.
 	DefaultValue string `json:"default_value,omitempty"`
+	// If true, the field is optional and can be omitted when submitting.
+	Optional bool `json:"optional,omitzero"`
 	// A regex pattern that the client can use to validate input client-side.
 	Pattern string `json:"pattern,omitempty"`
+	// Minimum and maximum input length as a hint for the client
+	MinLength int `json:"min_length,omitzero"`
+	MaxLength int `json:"max_length,omitzero"`
 	// For fields of type select, the valid options.
 	// Pattern may also be filled with a regex that matches the same options.
 	Options []string `json:"options,omitempty"`
@@ -298,33 +403,41 @@ func noopValidate(input string) (string, error) {
 }
 
 func (f *LoginInputDataField) FillDefaultValidate() {
-	if f.Validate != nil {
-		return
-	}
-	switch f.Type {
-	case LoginInputFieldTypePhoneNumber:
-		f.Validate = CleanPhoneNumber
-	case LoginInputFieldTypeEmail:
-		f.Validate = func(email string) (string, error) {
-			if !strings.ContainsRune(email, '@') {
-				return "", fmt.Errorf("invalid email")
-			}
-			return email, nil
-		}
-	default:
-		if f.Pattern != "" {
-			f.Validate = func(s string) (string, error) {
-				match, err := regexp.MatchString(f.Pattern, s)
-				if err != nil {
-					return "", err
-				} else if !match {
-					return "", fmt.Errorf("doesn't match regex `%s`", f.Pattern)
-				} else {
-					return s, nil
+	if f.Validate == nil {
+		switch f.Type {
+		case LoginInputFieldTypePhoneNumber:
+			f.Validate = CleanPhoneNumber
+		case LoginInputFieldTypeEmail:
+			f.Validate = func(email string) (string, error) {
+				if !strings.ContainsRune(email, '@') {
+					return "", fmt.Errorf("invalid email")
 				}
+				return email, nil
 			}
-		} else {
-			f.Validate = noopValidate
+		default:
+			if f.Pattern != "" {
+				f.Validate = func(s string) (string, error) {
+					match, err := regexp.MatchString(f.Pattern, s)
+					if err != nil {
+						return "", err
+					} else if !match {
+						return "", fmt.Errorf("doesn't match regex `%s`", f.Pattern)
+					} else {
+						return s, nil
+					}
+				}
+			} else {
+				f.Validate = noopValidate
+			}
+		}
+	}
+	if f.Optional {
+		validate := f.Validate
+		f.Validate = func(input string) (string, error) {
+			if input == "" {
+				return "", nil
+			}
+			return validate(input)
 		}
 	}
 }
@@ -335,20 +448,24 @@ type LoginUserInputParams struct {
 
 	// Attachments to display alongside the input fields.
 	Attachments []*LoginUserInputAttachment `json:"attachments"`
+
+	// If set, the client may allow the user to go back from this step. The login
+	// process must implement LoginProcessStepCancel.
+	CanCancel bool `json:"can_cancel,omitzero"`
 }
 
 type LoginUserInputAttachment struct {
 	Type     event.MessageType            `json:"type,omitempty"`
 	FileName string                       `json:"filename,omitempty"`
 	Content  []byte                       `json:"content,omitempty"`
-	Info     LoginUserInputAttachmentInfo `json:"info,omitempty"`
+	Info     LoginUserInputAttachmentInfo `json:"info,omitzero"`
 }
 
 type LoginUserInputAttachmentInfo struct {
 	MimeType string `json:"mimetype,omitempty"`
-	Width    int    `json:"w,omitempty"`
-	Height   int    `json:"h,omitempty"`
-	Size     int    `json:"size,omitempty"`
+	Width    int    `json:"w,omitzero"`
+	Height   int    `json:"h,omitzero"`
+	Size     int    `json:"size,omitzero"`
 }
 
 type LoginCompleteParams struct {

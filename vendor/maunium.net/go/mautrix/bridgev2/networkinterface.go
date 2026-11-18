@@ -199,7 +199,7 @@ type BridgeName struct {
 	BeeperBridgeType string `json:"beeper_bridge_type"`
 	// The default appservice port to use in the example config, defaults to 8080 if unset
 	// Official mautrix bridges will use ports defined in https://mau.fi/ports
-	DefaultPort uint16 `json:"default_port,omitempty"`
+	DefaultPort uint16 `json:"default_port,omitzero"`
 	// The default command prefix to use in the example config, defaults to NetworkID if unset. Must include the ! prefix.
 	DefaultCommandPrefix string `json:"default_command_prefix,omitempty"`
 }
@@ -331,11 +331,17 @@ type NetworkResettingNetwork interface {
 	ResetNetworkConnections()
 }
 
+type SplitPortalMigratingNetwork interface {
+	NetworkConnector
+	PreSplitPortalMigrate(context.Context) error
+}
+
 type RemoteEchoHandler func(RemoteMessage, *database.Message) (bool, error)
 
 type MatrixMessageResponse struct {
 	DB          *database.Message
 	StreamOrder int64
+	Disappear   *database.DisappearingSetting
 	// If Pending is set, the bridge will not save the provided message to the database.
 	// This should only be used if AddPendingToSave has been called.
 	Pending bool
@@ -364,6 +370,24 @@ type OutgoingTimeoutSuppressingNetworkAPI interface {
 	SuppressOutgoingTimeouts() bool
 }
 
+// MatrixSendError contains the details of a failed attempt to send a remote event to Matrix.
+type MatrixSendError struct {
+	Portal    *Portal
+	Intent    MatrixAPI
+	EventType event.Type
+	Err       error
+}
+
+// MatrixSendErrorHandlingNetworkAPI is an optional interface that network connectors can implement to
+// repair room state when sending a remote event to Matrix fails, e.g. fix power levels after M_FORBIDDEN.
+type MatrixSendErrorHandlingNetworkAPI interface {
+	NetworkAPI
+	// HandleMatrixSendError is called when sending a remote event to Matrix fails.
+	// If it returns true, the send is retried once with a new transaction ID, so it should only
+	// return true for errors where the homeserver definitely didn't accept the event.
+	HandleMatrixSendError(ctx context.Context, sendErr *MatrixSendError) (retry bool)
+}
+
 type NetworkGeneralCapabilities struct {
 	// Does the network connector support disappearing messages?
 	// This flag enables the message disappearing loop in the bridge.
@@ -384,6 +408,9 @@ type NetworkGeneralCapabilities struct {
 	// When a portal has a parent space which has its own parent, should the `network` field
 	// in `m.bridge` events be set to the top-level space or the immediate parent?
 	NetworkIsImmediateParent bool
+	// If set, HandleMatrixTyping is called again at this interval for users who are still typing.
+	// This should be set for networks where typing notifications expire unless they're repeated.
+	TypingRepeatInterval time.Duration
 }
 
 // NetworkAPI is an interface representing a remote network client for a single user login.
@@ -452,13 +479,6 @@ type BackgroundSyncingNetworkAPI interface {
 	// The client should connect to the remote network, handle pending messages, and then disconnect.
 	// This call should block until the entire sync is complete and the client is disconnected.
 	ConnectBackground(ctx context.Context, params *ConnectBackgroundParams) error
-}
-
-// CredentialExportingNetworkAPI is an optional interface that networks connectors can implement to support export of
-// the credentials associated with that login. Credential type is bridge specific.
-type CredentialExportingNetworkAPI interface {
-	NetworkAPI
-	ExportCredentials(ctx context.Context) any
 }
 
 // FetchMessagesParams contains the parameters for a message history pagination request.
@@ -579,6 +599,9 @@ type FetchMessagesResponse struct {
 	// When sending forward backfill (or the first batch in a room), this field can be set
 	// to mark the messages as read immediately after backfilling.
 	MarkRead bool
+	// When sending forward backfill without MarkRead, this field can be set to mark messages
+	// up to this timestamp as read after backfilling.
+	ReadUpTo time.Time
 
 	// If further fetches require requests that take longer than normal message fetches, this can be set to true.
 	// The bridge will then skip this portal in the backfill queue and only paginate further if the user requests it.
@@ -674,6 +697,33 @@ type ReadReceiptHandlingNetworkAPI interface {
 	HandleMatrixReadReceipt(ctx context.Context, msg *MatrixReadReceipt) error
 }
 
+type ViewLimitedMediaHandlingNetworkAPI interface {
+	NetworkAPI
+	HandleMatrixViewLimitedMedia(context.Context, *MatrixViewLimitedMedia) error
+}
+
+// PollResultsFetchingNetworkAPI is an optional interface that network connectors can implement
+// to let clients fetch the current results of a poll from the remote network.
+// This is meant for networks where individual votes can't be bridged as poll response events.
+type PollResultsFetchingNetworkAPI interface {
+	NetworkAPI
+	FetchPollResults(ctx context.Context, portal *Portal, msg *database.Message) (*PollResults, error)
+}
+
+type PollResults struct {
+	Closed      bool                `json:"closed"`
+	TotalVoters int                 `json:"total_voters"`
+	Answers     []*PollAnswerResult `json:"answers"`
+}
+
+type PollAnswerResult struct {
+	ID               string             `json:"id"`
+	Voters           int                `json:"voters"`
+	Chosen           bool               `json:"chosen,omitzero"`
+	RecentVoters     []networkid.UserID `json:"-"`
+	RecentVoterMXIDs []id.UserID        `json:"recent_voters,omitempty"`
+}
+
 // ChatViewingNetworkAPI is an optional interface that network connectors can implement to handle viewing chat status.
 type ChatViewingNetworkAPI interface {
 	NetworkAPI
@@ -760,6 +810,14 @@ type MessageRequestAcceptingNetworkAPI interface {
 	NetworkAPI
 	// HandleMatrixAcceptMessageRequest is called when the user accepts a message request.
 	HandleMatrixAcceptMessageRequest(ctx context.Context, msg *MatrixAcceptMessageRequest) error
+}
+
+// UserBlockingNetworkAPI is an optional interface that network connectors
+// can implement to block and unblock users on the remote network.
+type UserBlockingNetworkAPI interface {
+	NetworkAPI
+	// HandleMatrixBlockUser is called when the user blocks a remote user.
+	HandleMatrixBlockUser(ctx context.Context, msg *MatrixBlockUser) error
 }
 
 type ResolveIdentifierResponse struct {
@@ -857,7 +915,8 @@ type AltTargetFindingNetworkAPI interface {
 type ProvisioningCapabilities struct {
 	ResolveIdentifier ResolveIdentifierCapabilities    `json:"resolve_identifier"`
 	GroupCreation     map[string]GroupTypeCapabilities `json:"group_creation"`
-	ImagePackImport   bool                             `json:"image_pack_import,omitempty"`
+	ImagePackImport   bool                             `json:"image_pack_import,omitzero"`
+	ProfileUpdate     bool                             `json:"profile_update,omitzero"`
 }
 
 type ResolveIdentifierCapabilities struct {
@@ -895,11 +954,11 @@ type GroupFieldCapability struct {
 	// as the allowed flag can't be enforced properly when creating a group for an existing Matrix room.
 	Allowed bool `json:"allowed"`
 	// Is setting this field mandatory for the creation to succeed?
-	Required bool `json:"required,omitempty"`
+	Required bool `json:"required,omitzero"`
 	// The minimum/maximum length of the field, if applicable.
 	// For members, length means the number of members excluding the creator.
-	MinLength int `json:"min_length,omitempty"`
-	MaxLength int `json:"max_length,omitempty"`
+	MinLength int `json:"min_length,omitzero"`
+	MaxLength int `json:"max_length,omitzero"`
 
 	// Only for the disappear field: allowed disappearing settings
 	DisappearSettings *event.DisappearingTimerCapability `json:"settings,omitempty"`
@@ -967,6 +1026,16 @@ type MatrixMembershipChange struct {
 
 type MatrixMembershipResult struct {
 	RedirectTo networkid.UserID
+}
+
+type ProfileUpdateParams struct {
+	Name   *string              `json:"name,omitempty"`
+	Avatar *id.ContentURIString `json:"avatar,omitempty"`
+}
+
+type ProfileUpdatingNetworkAPI interface {
+	NetworkAPI
+	UpdateProfile(ctx context.Context, params *ProfileUpdateParams) error
 }
 
 type MembershipHandlingNetworkAPI interface {
@@ -1049,7 +1118,8 @@ type WebPushConfig struct {
 }
 
 type FCMPushConfig struct {
-	SenderID string `json:"sender_id"`
+	SenderID  string          `json:"sender_id"`
+	LegacyIID json.RawMessage `json:"legacy_iid,omitempty"`
 }
 
 type APNsPushConfig struct {
@@ -1062,7 +1132,7 @@ type PushConfig struct {
 	APNs *APNsPushConfig `json:"apns,omitempty"`
 	// If Native is true, it means the network supports registering for pushes
 	// that are delivered directly to the app without the use of a push relay.
-	Native bool `json:"native,omitempty"`
+	Native bool `json:"native,omitzero"`
 }
 
 // PushableNetworkAPI is an optional interface that network connectors can implement
@@ -1074,6 +1144,15 @@ type PushableNetworkAPI interface {
 	RegisterPushNotifications(ctx context.Context, pushType PushType, token string) error
 	// GetPushConfigs is used to find which types of push notifications the remote network can provide.
 	GetPushConfigs() *PushConfig
+}
+
+// PushUnregisteringNetworkAPI is an optional extension interface for PushableNetworkAPI
+// that network connectors can implement to clear any push state when the wrapper app stops using push.
+type PushUnregisteringNetworkAPI interface {
+	PushableNetworkAPI
+
+	// UnregisterPushNotifications is called when the wrapper app has stopped using push notifications for this login.
+	UnregisterPushNotifications(ctx context.Context) error
 }
 
 // PushParsingNetwork is an optional interface that network connectors can implement
@@ -1101,6 +1180,17 @@ type StickerImportingNetworkAPI interface {
 
 	DownloadImagePack(ctx context.Context, url string) (*ImportedImagePack, error)
 	ListImagePacks(ctx context.Context) ([]*event.ImagePackMetadata, error)
+}
+
+type ResolvedMedia struct {
+	Edit *ConvertedEditPart
+	// TODO field for raw event response
+}
+
+type MediaResolvingNetworkAPI interface {
+	NetworkAPI
+
+	ResolveMedia(ctx context.Context, portal *Portal, msg *database.Message, unresolvedMedia json.RawMessage) (*ResolvedMedia, error)
 }
 
 type RemoteEventType int
@@ -1194,6 +1284,11 @@ type RemotePreHandler interface {
 	PreHandle(ctx context.Context, portal *Portal)
 }
 
+type RemotePreHandlerWithResult interface {
+	RemoteEvent
+	PreHandleWithResult(ctx context.Context, portal *Portal) *EventHandlingResult
+}
+
 type RemotePostHandler interface {
 	RemoteEvent
 	PostHandle(ctx context.Context, portal *Portal)
@@ -1201,7 +1296,7 @@ type RemotePostHandler interface {
 
 type RemoteChatInfoChange interface {
 	RemoteEvent
-	GetChatInfoChange(ctx context.Context) (*ChatInfoChange, error)
+	GetChatInfoChange(ctx context.Context, portal *Portal) (*ChatInfoChange, error)
 }
 
 type RemoteChatResync interface {
@@ -1371,6 +1466,11 @@ type RemoteReadReceiptWithStreamOrder interface {
 	GetReadUpToStreamOrder() int64
 }
 
+type RemoteReadReceiptWithThread interface {
+	RemoteReadReceipt
+	GetReceiptThread() networkid.MessageID
+}
+
 type RemoteDeliveryReceipt interface {
 	RemoteEvent
 	GetReceiptTargets() []networkid.MessageID
@@ -1506,6 +1606,12 @@ type MatrixReadReceipt struct {
 	Implicit bool
 }
 
+type MatrixViewLimitedMedia struct {
+	Portal  *Portal
+	Message *database.Message
+	Content *event.BeeperViewLimitedMedia
+}
+
 type MatrixTyping struct {
 	Portal   *Portal
 	IsTyping bool
@@ -1518,6 +1624,7 @@ type MatrixViewingChat struct {
 }
 
 type MatrixDeleteChat = MatrixEventBase[*event.BeeperChatDeleteEventContent]
+type MatrixBlockUser = MatrixEventBase[*event.BeeperBlockUserEventContent]
 type MatrixAcceptMessageRequest = MatrixEventBase[*event.BeeperAcceptMessageRequestEventContent]
 type MatrixMarkedUnread = MatrixRoomMeta[*event.MarkedUnreadEventContent]
 type MatrixMute = MatrixRoomMeta[*event.BeeperMuteEventContent]

@@ -3,6 +3,7 @@ package messagix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -44,7 +45,9 @@ type SocketLSRequestPayload struct {
 	Type      int    `json:"type"`
 }
 
-func (c *Client) onSocketConnect(ctx context.Context) error {
+var ErrFatalSocketSyncError = errors.New("failed to ensure db 1 is synced")
+
+func (c *Client) onSocketConnect(ctx context.Context, _ func(error)) error {
 	c.canSendMessages.Set()
 
 	reconnect := c.socketWasSynced.Load()
@@ -57,7 +60,7 @@ func (c *Client) onSocketConnect(ctx context.Context) error {
 
 	err := c.syncManager.ensureSyncedSocket(ctx, minimalFBSync)
 	if err != nil {
-		return fmt.Errorf("failed to ensure db 1 is synced: %w", err)
+		return fmt.Errorf("%w: %w", ErrFatalSocketSyncError, err)
 	}
 
 	if reconnect {
@@ -131,6 +134,7 @@ func (c *Client) sendInitialThreadFetch(ctx context.Context) error {
 	}
 
 	c.Logger.Trace().Any("data", string(payload)).Msg("Sync groups tasks")
+	c.syncManager.markInitialThreadFetch(1, 95)
 	_, err = c.makeLSRequest(ctx, payload, 3)
 	if err != nil {
 		return fmt.Errorf("failed to send sync tasks: %w", err)
@@ -153,6 +157,7 @@ func (c *Client) handleFrame(ctx context.Context, frame []byte) error {
 		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to parse table")
 	} else {
 		c.HandleEvent(ctx, tbl)
+		c.syncManager.handleLiveSyncResets(ctx, tbl)
 	}
 	return nil
 }
@@ -164,7 +169,7 @@ func (c *Client) PostHandlePublishResponse(tbl *table.LSTable) {
 	syncGroupsNeedUpdate := methods.NeedUpdateSyncGroups(tbl)
 	if syncGroupsNeedUpdate {
 		c.Logger.Debug().
-			Any("LSExecuteFirstBlockForSyncTransaction", tbl.LSExecuteFirstBlockForSyncTransaction).
+			Any("LSExecuteFirstBlockForSyncTransaction", tbl.GetLSExecuteFirstBlockForSyncTransactionV4()).
 			Any("LSUpsertSyncGroupThreadsRange", tbl.LSUpsertSyncGroupThreadsRange).
 			Msg("Updating sync groups")
 		err := c.syncManager.updateSyncGroupCursors(tbl)

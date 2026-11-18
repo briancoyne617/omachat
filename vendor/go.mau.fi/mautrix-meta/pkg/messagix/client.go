@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/endpoints"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
+	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
@@ -30,8 +31,8 @@ var ErrClientIsNil = whatsmeow.ErrClientIsNil
 type EventHandler func(ctx context.Context, evt any)
 
 type Config struct {
-	ClientSettings           exhttp.ClientSettings
-	LogRedactedBloksPayloads bool
+	ClientSettings            exhttp.ClientSettings
+	LogRedactedLoginResponses bool
 }
 
 type Client struct {
@@ -62,6 +63,8 @@ type Client struct {
 	catRefreshLock         sync.Mutex
 	unnecessaryCATRequests int
 
+	receiverFetch receiverFetchState
+
 	stopCurrentConnections atomic.Pointer[context.CancelFunc]
 	connectionLoopStopped  *exsync.Event
 	canSendMessages        *exsync.Event
@@ -83,7 +86,7 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 	}
 	cli.configs = httpclient.NewConfigs(cli)
 	cli.http = httpclient.NewHTTPClient(cli, cli.configs, cfg.ClientSettings)
-	cli.http.LogRedactedBloksPayloads = cfg.LogRedactedBloksPayloads
+	cli.http.LogRedactedLoginResponses = cfg.LogRedactedLoginResponses
 	cli.nextTaskID.Store(-1) // start from 0
 	cli.connectionLoopStopped.Set()
 
@@ -116,6 +119,14 @@ func (c *Client) GetHTTP() *httpclient.HTTPClient {
 		return nil
 	}
 	return c.http
+}
+
+func (c *Client) GetSecureHistoryClient() *securehistory.Client {
+	return &securehistory.Client{
+		HTTP:           c.http,
+		RegistrationID: c.configs.BrowserConfigTable.MessengerWebInitData.SessionID,
+		AppID:          c.configs.BrowserConfigTable.CurrentUserInitialData.AppID,
+	}
 }
 
 type dumpedState struct {
@@ -154,6 +165,8 @@ func (c *Client) LoadState(state json.RawMessage) error {
 	}
 
 	c.configs = dumped.Configs
+	c.configs.SetClient(c)
+	c.http.SetConfigs(c.configs)
 	c.syncManager = c.newSyncManager()
 	c.syncManager.store = dumped.SyncStore
 	c.updateSocketIDs()

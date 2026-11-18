@@ -17,7 +17,6 @@ import (
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/jsontime"
-	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/requestlog"
 
 	"maunium.net/go/mautrix"
@@ -63,8 +62,8 @@ func (ks *KeyServer) Register(r *http.ServeMux, log zerolog.Logger) {
 	keyRouter.HandleFunc("GET /v2/query/{serverName}", ks.GetQueryKeys)
 	keyRouter.HandleFunc("POST /v2/query", ks.PostQueryKeys)
 	errorBodies := exhttp.ErrorBodies{
-		NotFound:         exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Unrecognized endpoint")).MarshalJSON()),
-		MethodNotAllowed: exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Invalid method for endpoint")).MarshalJSON()),
+		NotFound:         exerrors.Must(new(mautrix.MUnrecognized.WithMessage("Unrecognized endpoint")).MarshalJSON()),
+		MethodNotAllowed: exerrors.Must(new(mautrix.MUnrecognized.WithMessage("Invalid method for endpoint")).MarshalJSON()),
 	}
 	r.Handle("/_matrix/key/", exhttp.ApplyMiddleware(
 		keyRouter,
@@ -186,7 +185,7 @@ func (ks *KeyServer) GetQueryKeys(w http.ResponseWriter, r *http.Request) {
 			resp.ServerKeys = append(resp.ServerKeys, key.GenerateKeyResponse(serverName, nil))
 		}
 	} else if ks.OtherKeys != nil {
-		otherKey, err := ks.OtherKeys.LoadKeys(serverName)
+		otherKey, err := ks.OtherKeys.LoadKeys(r.Context(), serverName, -1)
 		if err != nil {
 			mautrix.MUnknown.WithMessage("Failed to load keys from cache").Write(w)
 			return

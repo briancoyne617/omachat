@@ -53,8 +53,12 @@ func (portal *PortalInternals) UnwrapBeeperSendState(ctx context.Context, evt *e
 	return (*Portal)(portal).unwrapBeeperSendState(ctx, evt)
 }
 
-func (portal *PortalInternals) SendSuccessStatus(ctx context.Context, evt *event.Event, streamOrder int64, newEventID id.EventID) {
-	(*Portal)(portal).sendSuccessStatus(ctx, evt, streamOrder, newEventID)
+func (portal *PortalInternals) WaitForReceiverLogin(ctx context.Context, login *UserLogin) bool {
+	return (*Portal)(portal).waitForReceiverLogin(ctx, login)
+}
+
+func (portal *PortalInternals) SendSuccessStatus(ctx context.Context, evt *event.Event, streamOrder int64, newEventID id.EventID, disappear *database.DisappearingSetting) {
+	(*Portal)(portal).sendSuccessStatus(ctx, evt, streamOrder, newEventID, disappear)
 }
 
 func (portal *PortalInternals) SendErrorStatus(ctx context.Context, evt *event.Event, err error) {
@@ -81,6 +85,10 @@ func (portal *PortalInternals) CallReadReceiptHandler(ctx context.Context, login
 	(*Portal)(portal).callReadReceiptHandler(ctx, login, rrClient, evt, userPortal)
 }
 
+func (portal *PortalInternals) StartDisappearingAfterRead(ctx context.Context, source *UserLogin, readUpTo, timestamp time.Time, fromMe bool) {
+	(*Portal)(portal).startDisappearingAfterRead(ctx, source, readUpTo, timestamp, fromMe)
+}
+
 func (portal *PortalInternals) HandleMatrixTyping(ctx context.Context, evt *event.Event) EventHandlingResult {
 	return (*Portal)(portal).handleMatrixTyping(ctx, evt)
 }
@@ -103,6 +111,10 @@ func (portal *PortalInternals) ParseInputTransactionID(origSender *OrigSender, e
 
 func (portal *PortalInternals) HandleMatrixMessage(ctx context.Context, sender *UserLogin, origSender *OrigSender, evt *event.Event) EventHandlingResult {
 	return (*Portal)(portal).handleMatrixMessage(ctx, sender, origSender, evt)
+}
+
+func (portal *PortalInternals) ScheduleOutgoingDisappearingMessage(ctx context.Context, message *database.Message, ds database.DisappearingSetting) {
+	(*Portal)(portal).scheduleOutgoingDisappearingMessage(ctx, message, ds)
 }
 
 func (portal *PortalInternals) PendingMessageTimeoutLoop(ctx context.Context, cfg *OutgoingTimeoutConfig) {
@@ -177,8 +189,8 @@ func (portal *PortalInternals) ApplyRelationMeta(ctx context.Context, content *e
 	(*Portal)(portal).applyRelationMeta(ctx, content, replyTo, threadRoot, prevThreadEvent)
 }
 
-func (portal *PortalInternals) SendConvertedMessage(ctx context.Context, source *UserLogin, id networkid.MessageID, intent MatrixAPI, senderID networkid.UserID, converted *ConvertedMessage, ts time.Time, streamOrder int64, logContext func(*zerolog.Event) *zerolog.Event) ([]*database.Message, EventHandlingResult) {
-	return (*Portal)(portal).sendConvertedMessage(ctx, source, id, intent, senderID, converted, ts, streamOrder, logContext)
+func (portal *PortalInternals) SendConvertedMessage(ctx context.Context, source *UserLogin, id networkid.MessageID, intent MatrixAPI, senderID networkid.UserID, converted *ConvertedMessage, ts time.Time, streamOrder int64, logContext func(*zerolog.Event) *zerolog.Event, save bool) ([]*database.Message, EventHandlingResult) {
+	return (*Portal)(portal).sendConvertedMessage(ctx, source, id, intent, senderID, converted, ts, streamOrder, logContext, save)
 }
 
 func (portal *PortalInternals) CheckPendingMessage(ctx context.Context, evt RemoteMessage) (bool, *database.Message) {
@@ -357,8 +369,8 @@ func (portal *PortalInternals) RemoveMXID(ctx context.Context, alreadyLocked boo
 	return (*Portal)(portal).removeMXID(ctx, alreadyLocked)
 }
 
-func (portal *PortalInternals) RemoveInPortalCache(ctx context.Context) {
-	(*Portal)(portal).removeInPortalCache(ctx)
+func (portal *PortalInternals) RemoveInPortalCache(ctx context.Context, alreadyLocked bool) {
+	(*Portal)(portal).removeInPortalCache(ctx, alreadyLocked)
 }
 
 func (portal *PortalInternals) UnlockedDelete(ctx context.Context) error {

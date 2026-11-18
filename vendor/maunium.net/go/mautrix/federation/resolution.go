@@ -29,6 +29,7 @@ type ResolvedServerName struct {
 	HostHeader string    `json:"host_header"`
 	IPPort     []string  `json:"ip_port"`
 	Expires    time.Time `json:"expires"`
+	FetchedAt  time.Time `json:"fetched_at"`
 }
 
 type ResolveServerNameOpts struct {
@@ -57,6 +58,7 @@ func ResolveServerName(ctx context.Context, serverName string, opts ...*ResolveS
 		HostHeader: serverName,
 		IPPort:     []string{serverName},
 		Expires:    time.Now().Add(24 * time.Hour),
+		FetchedAt:  time.Now(),
 	}
 	hostname, port, ok := ParseServerName(serverName)
 	if !ok {
@@ -130,8 +132,8 @@ func parseCacheControl(resp *http.Response) time.Duration {
 	if cc == "" {
 		return 0
 	}
-	parts := strings.Split(cc, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(cc, ",")
+	for part := range parts {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 1)
 		switch kv[0] {
 		case "no-cache", "no-store":
@@ -194,5 +196,5 @@ func RequestWellKnown(ctx context.Context, cli *http.Client, hostname string) (*
 	} else if cacheDuration > MaxCacheDuration {
 		cacheDuration = MaxCacheDuration
 	}
-	return &respData, time.Now().Add(24 * time.Hour), nil
+	return &respData, time.Now().Add(cacheDuration), nil
 }

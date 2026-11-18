@@ -93,6 +93,12 @@ export interface RoomFeatures {
 	delete_chat?: boolean
 	/** Whether deleting the chat for all participants is supported. */
 	delete_chat_for_everyone?: boolean
+	/** Whether blocking/unblocking the user is supported. Only applicable to DMs. */
+	block_user?: boolean
+	/** Whether unblocking is unsupported even though blocking is. Only applicable when block_user is set. */
+	no_unblock?: boolean
+	/** Whether block requests can also report the chat as spam. */
+	report_spam?: boolean
 	/** What can be done with message requests? */
 	message_request?: {
 		accept_with_message?: CapabilitySupportLevel
@@ -164,7 +170,13 @@ export interface FileFeatures {
 	max_duration?: seconds
 
 	/** Can this type of file be sent as view-once media? */
-	view_once?: boolean
+	view_limited_types?: ViewLimitedCapability[]
+}
+
+export interface ViewLimitedCapability {
+	type: "time" | "count"
+	count?: integer
+	time?: milliseconds
 }
 
 export enum DisappearingType {

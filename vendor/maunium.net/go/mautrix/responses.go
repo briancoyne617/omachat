@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/tidwall/gjson"
+	"go.mau.fi/util/exmaps"
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 
@@ -130,7 +131,7 @@ type RespRedactUserEvents struct {
 
 // RespMediaConfig is the JSON response for https://spec.matrix.org/v1.4/client-server-api/#get_matrixmediav3config
 type RespMediaConfig struct {
-	UploadSize int64 `json:"m.upload.size,omitempty"`
+	UploadSize int64 `json:"m.upload.size,omitzero"`
 }
 
 // RespMediaUpload is the JSON response for https://spec.matrix.org/v1.2/client-server-api/#post_matrixmediav3upload
@@ -141,13 +142,13 @@ type RespMediaUpload struct {
 // RespCreateMXC is the JSON response for https://spec.matrix.org/v1.7/client-server-api/#post_matrixmediav1create
 type RespCreateMXC struct {
 	ContentURI      id.ContentURI      `json:"content_uri"`
-	UnusedExpiresAt jsontime.UnixMilli `json:"unused_expires_at,omitempty"`
+	UnusedExpiresAt jsontime.UnixMilli `json:"unused_expires_at,omitzero"`
 
 	UnstableUploadURL string `json:"com.beeper.msc3870.upload_url,omitempty"`
 
 	// Beeper extensions for uploading unique media only once
 	BeeperUniqueID    string             `json:"com.beeper.unique_id,omitempty"`
-	BeeperCompletedAt jsontime.UnixMilli `json:"com.beeper.completed_at,omitempty"`
+	BeeperCompletedAt jsontime.UnixMilli `json:"com.beeper.completed_at,omitzero"`
 }
 
 // RespPreviewURL is the JSON response for https://spec.matrix.org/v1.2/client-server-api/#get_matrixmediav3preview_url
@@ -155,10 +156,10 @@ type RespPreviewURL = event.LinkPreview
 
 // RespUserInteractive is the JSON response for https://spec.matrix.org/v1.2/client-server-api/#user-interactive-authentication-api
 type RespUserInteractive struct {
-	Flows     []UIAFlow                `json:"flows,omitempty"`
-	Params    map[AuthType]interface{} `json:"params,omitempty"`
-	Session   string                   `json:"session,omitempty"`
-	Completed []string                 `json:"completed,omitempty"`
+	Flows     []UIAFlow        `json:"flows,omitempty"`
+	Params    map[AuthType]any `json:"params,omitempty"`
+	Session   string           `json:"session,omitempty"`
+	Completed []string         `json:"completed,omitempty"`
 
 	ErrCode string `json:"errcode,omitempty"`
 	Error   string `json:"error,omitempty"`
@@ -185,7 +186,7 @@ type RespUserDisplayName struct {
 
 type RespUserProfile struct {
 	DisplayName string         `json:"displayname,omitempty"`
-	AvatarURL   id.ContentURI  `json:"avatar_url,omitempty"`
+	AvatarURL   id.ContentURI  `json:"avatar_url"`
 	Extra       map[string]any `json:"-"`
 }
 
@@ -256,7 +257,7 @@ func (r *UserDirectoryEntry) MarshalJSON() ([]byte, error) {
 type RespMutualRooms struct {
 	Joined    []id.RoomID `json:"joined"`
 	NextBatch string      `json:"next_batch,omitempty"`
-	Count     int         `json:"count,omitempty"`
+	Count     int         `json:"count,omitzero"`
 }
 
 type RespRoomSummary struct {
@@ -281,7 +282,7 @@ type RespRegister struct {
 	UserID      id.UserID   `json:"user_id"`
 
 	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresInMS  int64  `json:"expires_in_ms,omitempty"`
+	ExpiresInMS  int64  `json:"expires_in_ms,omitzero"`
 
 	// Deprecated: homeserver should be parsed from the user ID
 	HomeServer string `json:"home_server,omitempty"`
@@ -298,10 +299,8 @@ type RespLoginFlows struct {
 
 func (rlf *RespLoginFlows) FirstFlowOfType(flowTypes ...AuthType) *LoginFlow {
 	for _, flow := range rlf.Flows {
-		for _, flowType := range flowTypes {
-			if flow.Type == flowType {
-				return &flow
-			}
+		if slices.Contains(flowTypes, flow.Type) {
+			return &flow
 		}
 	}
 	return nil
@@ -319,7 +318,7 @@ type RespLogin struct {
 	WellKnown   *ClientWellKnown `json:"well_known,omitempty"`
 
 	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresInMS  int64  `json:"expires_in_ms,omitempty"`
+	ExpiresInMS  int64  `json:"expires_in_ms,omitzero"`
 }
 
 // RespLogout is the JSON response for https://spec.matrix.org/v1.2/client-server-api/#post_matrixclientv3logout
@@ -328,6 +327,11 @@ type RespLogout struct{}
 // RespCreateRoom is the JSON response for https://spec.matrix.org/v1.2/client-server-api/#post_matrixclientv3createroom
 type RespCreateRoom struct {
 	RoomID id.RoomID `json:"room_id"`
+}
+
+// RespUpgradeRoom is the JSON response for https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3roomsroomidupgrade
+type RespUpgradeRoom struct {
+	ReplacementRoom id.RoomID `json:"replacement_room"`
 }
 
 type RespMembers struct {
@@ -372,7 +376,7 @@ func (sel SyncEventsList) IsZero() bool {
 
 type SyncTimeline struct {
 	SyncEventsList
-	Limited   bool   `json:"limited,omitempty"`
+	Limited   bool   `json:"limited,omitzero"`
 	PrevBatch string `json:"prev_batch,omitempty"`
 }
 
@@ -416,8 +420,8 @@ func (dl DeviceLists) IsZero() bool {
 }
 
 type OTKCount struct {
-	Curve25519       int `json:"curve25519,omitempty"`
-	SignedCurve25519 int `json:"signed_curve25519,omitempty"`
+	Curve25519       int `json:"curve25519,omitzero"`
+	SignedCurve25519 int `json:"signed_curve25519,omitzero"`
 
 	// For appservice OTK counts only: the user ID in question
 	UserID   id.UserID   `json:"-"`
@@ -463,11 +467,43 @@ type UnreadNotificationCounts struct {
 }
 
 type SyncInvitedRoom struct {
-	State SyncEventsList `json:"invite_state"`
+	State     SyncEventsList `json:"invite_state"`
+	FullState SyncEventsList `json:"state,omitzero"`
+}
+
+func mergeStates(stripped, full SyncEventsList) []*event.Event {
+	if len(full.Events) == 0 {
+		return stripped.Events
+	}
+	type typeKeyTuple struct {
+		evtType  string
+		stateKey string
+	}
+	existingFullState := make(exmaps.Set[typeKeyTuple], len(full.Events))
+	bestState := make([]*event.Event, 0, len(stripped.Events))
+	for _, ev := range full.Events {
+		existingFullState.Add(typeKeyTuple{evtType: ev.Type.Type, stateKey: ev.GetStateKey()})
+		bestState = append(bestState, ev)
+	}
+	for _, ev := range stripped.Events {
+		if !existingFullState.Has(typeKeyTuple{evtType: ev.Type.Type, stateKey: ev.GetStateKey()}) {
+			bestState = append(bestState, ev)
+		}
+	}
+	return bestState
+}
+
+func (sir *SyncInvitedRoom) BestState() []*event.Event {
+	return mergeStates(sir.State, sir.FullState)
 }
 
 type SyncKnockedRoom struct {
-	State SyncEventsList `json:"knock_state"`
+	State     SyncEventsList `json:"knock_state"`
+	FullState SyncEventsList `json:"state,omitzero"`
+}
+
+func (skr *SyncKnockedRoom) BestState() []*event.Event {
+	return mergeStates(skr.State, skr.FullState)
 }
 
 type RespTurnServer struct {
@@ -480,6 +516,12 @@ type RespTurnServer struct {
 type RespRTCTransports struct {
 	RTCTransports []*RTCTransport `json:"rtc_transports"`
 }
+
+type RespRTCLivekitGetToken struct {
+	JWT string `json:"jwt"`
+}
+
+type RespRTCLivekitDelegateDelayedLeave struct{}
 
 type RTCTransportType string
 
@@ -508,7 +550,7 @@ type RespUploadKeys struct {
 }
 
 type RespQueryKeys struct {
-	Failures        map[string]interface{}                   `json:"failures,omitempty"`
+	Failures        map[string]any                           `json:"failures,omitempty"`
 	DeviceKeys      map[id.UserID]map[id.DeviceID]DeviceKeys `json:"device_keys"`
 	MasterKeys      map[id.UserID]CrossSigningKeys           `json:"master_keys"`
 	SelfSigningKeys map[id.UserID]CrossSigningKeys           `json:"self_signing_keys"`
@@ -516,12 +558,12 @@ type RespQueryKeys struct {
 }
 
 type RespClaimKeys struct {
-	Failures    map[string]interface{}                                `json:"failures,omitempty"`
+	Failures    map[string]any                                        `json:"failures,omitempty"`
 	OneTimeKeys map[id.UserID]map[id.DeviceID]map[id.KeyID]OneTimeKey `json:"one_time_keys"`
 }
 
 type RespUploadSignatures struct {
-	Failures map[string]interface{} `json:"failures,omitempty"`
+	Failures map[string]any `json:"failures,omitempty"`
 }
 
 type RespKeyChanges struct {
@@ -556,9 +598,10 @@ type RespCapabilities struct {
 	SetAvatarURL              *CapBooleanTrue               `json:"m.set_avatar_url,omitempty"`
 	ThreePIDChanges           *CapBooleanTrue               `json:"m.3pid_changes,omitempty"`
 	GetLoginToken             *CapBooleanTrue               `json:"m.get_login_token,omitempty"`
+	WebPush                   *CapWebPush                   `json:"org.matrix.msc4174.webpush,omitempty"`
 	UnstableAccountModeration *CapUnstableAccountModeration `json:"uk.timedout.msc4323,omitempty"`
 
-	Custom map[string]interface{} `json:"-"`
+	Custom map[string]any `json:"-"`
 }
 
 type serializableRespCapabilities RespCapabilities
@@ -583,7 +626,7 @@ func (rc *RespCapabilities) UnmarshalJSON(data []byte) error {
 	}
 	// Remove non-custom capabilities from the custom map so that they don't get overridden when serializing back
 	for _, field := range reflect.VisibleFields(reflect.TypeOf(rc).Elem()) {
-		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		jsonTag, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if jsonTag != "-" && jsonTag != "" {
 			delete(rc.Custom, jsonTag)
 		}
@@ -592,10 +635,10 @@ func (rc *RespCapabilities) UnmarshalJSON(data []byte) error {
 }
 
 func (rc *RespCapabilities) MarshalJSON() ([]byte, error) {
-	marshalableCopy := make(map[string]interface{}, len(rc.Custom))
+	marshalableCopy := make(map[string]any, len(rc.Custom))
 	val := reflect.ValueOf(rc).Elem()
 	for _, field := range reflect.VisibleFields(val.Type()) {
-		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		jsonTag, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if jsonTag != "-" && jsonTag != "" {
 			fieldVal := val.FieldByIndex(field.Index)
 			if !fieldVal.IsNil() {
@@ -604,9 +647,7 @@ func (rc *RespCapabilities) MarshalJSON() ([]byte, error) {
 		}
 	}
 	if rc.Custom != nil {
-		for key, value := range rc.Custom {
-			marshalableCopy[key] = value
-		}
+		maps.Copy(marshalableCopy, rc.Custom)
 	}
 	var buf bytes.Buffer
 	buf.WriteString(`{"capabilities":`)
@@ -635,6 +676,22 @@ type CapBooleanFalse CapBoolean
 // IsEnabled returns true if the capability is enabled explicitly. If it's not specified, this returns false.
 func (cb *CapBooleanFalse) IsEnabled() bool {
 	return cb != nil && cb.Enabled
+}
+
+type CapWebPush struct {
+	Enabled  bool   `json:"enabled"`
+	VAPIDKey string `json:"vapid,omitempty"`
+}
+
+func (cb *CapWebPush) IsEnabled() bool {
+	return cb != nil && cb.Enabled
+}
+
+func (cb *CapWebPush) GetVAPIDKey() string {
+	if cb == nil {
+		return ""
+	}
+	return cb.VAPIDKey
 }
 
 type CapRoomVersionStability string
@@ -763,7 +820,13 @@ type RespGetRelations struct {
 	Chunk          []*event.Event `json:"chunk"`
 	NextBatch      string         `json:"next_batch,omitempty"`
 	PrevBatch      string         `json:"prev_batch,omitempty"`
-	RecursionDepth int            `json:"recursion_depth,omitempty"`
+	RecursionDepth int            `json:"recursion_depth,omitzero"`
+}
+
+// RespGetThreads is the JSON response for https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv1roomsroomidthreads
+type RespGetThreads struct {
+	Chunk     []*event.Event `json:"chunk"`
+	NextBatch string         `json:"next_batch,omitempty"`
 }
 
 // RespSuspended is the response body for https://github.com/matrix-org/matrix-spec-proposals/pull/4323
@@ -778,7 +841,7 @@ type RespLocked struct {
 
 type ConnectionInfo struct {
 	IP        string             `json:"ip,omitempty"`
-	LastSeen  jsontime.UnixMilli `json:"last_seen,omitempty"`
+	LastSeen  jsontime.UnixMilli `json:"last_seen"`
 	UserAgent string             `json:"user_agent,omitempty"`
 }
 
@@ -823,4 +886,8 @@ type SearchResult struct {
 	Rank    float64      `json:"rank"`
 	Event   *event.Event `json:"result"`
 	Context *RespContext `json:"context,omitempty"`
+}
+
+type RespPushers struct {
+	Pushers []Pusher `json:"pushers"`
 }

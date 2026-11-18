@@ -11,9 +11,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
-	"net/http"
+	"maps"
 	"regexp"
 	"strings"
 	"time"
@@ -25,42 +26,26 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix/loginerrors"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
 
-var (
-	ErrLoginPhoneNumber      = bridgev2.RespError{ErrCode: "FI.MAU.META_PHONE_NUMBER", Err: "Phone number login is not supported, please try email address or username", StatusCode: http.StatusBadRequest}
-	ErrLoginInvalidUsername  = bridgev2.RespError{ErrCode: "FI.MAU.META_MATRIX_ID", Err: "That doesn't look like a valid username, please enter your Facebook email address or username", StatusCode: http.StatusBadRequest}
-	ErrLoginAFADStopped      = bridgev2.RespError{ErrCode: "FI.MAU.META_AFAD_STOPPED", Err: "The approval request expired or was denied, please try logging in again", StatusCode: http.StatusBadRequest}
-	ErrLoginMandatoryOAuth   = bridgev2.RespError{ErrCode: "FI.MAU.META_OAUTH_MANDATORY", Err: "Meta is requiring Google sign-in which is not supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
-	ErrLoginNoSupportedMFA   = bridgev2.RespError{ErrCode: "FI.MAU.META_NO_SUPPORTED_MFA", Err: "None of the available MFA methods are supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
-	ErrLoginReCaptcha        = bridgev2.RespError{ErrCode: "FI.MAU.META_GOOGLE_RECAPTCHA", Err: "Meta is requiring Google reCAPTCHA authentication which is not supported. It may help to try again, log in from the official app/website first, or change MFA settings for your Facebook account"}
-	ErrLoginNoSMSAvailable   = bridgev2.RespError{ErrCode: "FI.MAU.META_NO_SMS_AVAILABLE", Err: "Meta is refusing to send SMS codes right now. Try again later, or use/add a different MFA method for your Facebook account"}
-	ErrLoginMandatoryPasskey = bridgev2.RespError{ErrCode: "FI.MAU.META_PASSKEY_MANDATORY", Err: "Meta is requiring passkey sign-in which is not supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
-)
-
-// This error is returned in cases where we have observed Meta returning an error that is
-// not due to anything the bridge or user has done wrong, and will cause login to fail for
-// this account even in the official Messenger iOS app.
-//
-// Using an IP address with a low reputation for Meta makes it more likely that Meta will
-// block logins for an undisclosed reason, but such blocks are account-specific and other
-// accounts can still be logged into.
-//
-// Account logins are still sometimes blocked even when using a high-reputation residential
-// IP address. It's possible that account configuration plays a role, for example which MFA
-// methods are enabled, but the details are not known.
-func ErrLoginUninformative(callsite string) bridgev2.RespError {
-	return bridgev2.RespError{
-		ErrCode:       "FI.MAU.META_UNINFORMATIVE_ERROR",
-		Err:           "Facebook rejected the login without providing a reason. It may help to try again, log in from the official app/website first, or change MFA settings for your Facebook account",
-		StatusCode:    http.StatusBadRequest,
-		InternalError: "Uninformative login rejection at callsite: " + callsite,
-	}
-}
-
 func (bb *BloksBundle) FindDescendant(pred func(*BloksTreeComponent) bool) *BloksTreeComponent {
 	return bb.Layout.Payload.Tree.FindDescendant(pred)
+}
+
+func (bb *BloksBundle) FindDescendantIncludingEmbedded(pred func(*BloksTreeComponent) bool) *BloksTreeComponent {
+	res := bb.Layout.Payload.Tree.FindDescendant(pred)
+	if res != nil {
+		return res
+	}
+	for _, embedded := range bb.Layout.Payload.Embedded {
+		res := embedded.Contents.FindDescendant(pred)
+		if res != nil {
+			return res
+		}
+	}
+	return nil
 }
 
 func (bb *BloksBundle) FindDescendants(pred func(*BloksTreeComponent) bool) []*BloksTreeComponent {
@@ -303,10 +288,19 @@ type BrowserState string
 const (
 	StateUnknown                BrowserState = ""
 	StateTestCaptcha            BrowserState = "test-captcha"
-	StateInitial                BrowserState = "initial"
+	StateInitialMessenger       BrowserState = "initial-messenger"
+	StateInitialInstagram       BrowserState = "initial-instagram"
+	StateLandingPage            BrowserState = "landing-page"
 	StateEmailPasswordPage      BrowserState = "enter-email-and-password-page"
+	StateAuthenticationConfirm  BrowserState = "authentication-confirmation-page"
+	StateAuthenticationCodePage BrowserState = "authentication-code-page"
+	StateDialog                 BrowserState = "dialog"
+	StateAccountSelectionPage   BrowserState = "account-selection-page"
+	StateAccountRecoveryPage    BrowserState = "account-recovery-page"
+	StatePasswordFormPage       BrowserState = "password-form-page"
 	StateCodeEntryPage          BrowserState = "enter-code-page"
 	StateCaptchaPage            BrowserState = "captcha-page"
+	StateReCaptchaPage          BrowserState = "recaptcha-page"
 	StateMFALandingPage         BrowserState = "mfa-landing-page"
 	StateChooseMFAPage          BrowserState = "choose-mfa-type-page"
 	StateAFADPage               BrowserState = "afad-page"
@@ -321,6 +315,7 @@ const (
 	StateWhatsAppPageAfterSend  BrowserState = "whatsapp-page-after-send"
 	StatePasskeyPage            BrowserState = "passkey"
 	StateSilentCaptchaPage      BrowserState = "noop-captcha"
+	StateSuggestedAccountPage   BrowserState = "suggested-account-page"
 	StateSuccess                BrowserState = "success"
 )
 
@@ -335,19 +330,199 @@ type Browser struct {
 	State         BrowserState
 	PreviousState BrowserState
 
-	CurrentPage  *BloksBundle
-	PreviousPage *BloksBundle
+	CurrentPage       *BloksBundle
+	PreviousPage      *BloksBundle
+	PreviousPageState BrowserState
 
-	Config *BrowserConfig
-	Bridge *InterpBridge
+	Config  *BrowserConfig
+	Bridge  *InterpBridge
+	profile browserPlatformProfile
 
 	AFADNotification string
 	AFADInterval     time.Duration
 	AFADCallback     func() error
-	LoginData        string
-	DisplayedURL     string
+	MFACanGoBack     bool
 
-	LastError string
+	AuthCodeEntryChosen bool
+
+	LoginData    string
+	DisplayedURL string
+
+	PendingDialog       *BloksDialog
+	DialogPreviousState BrowserState
+
+	PasswordResetRequested bool
+
+	LastError           string
+	PageTransitionCount uint64
+	ActionRPCCount      uint64
+}
+
+func (b *Browser) passwordResetRequiredError() error {
+	if !b.PasswordResetRequested || b.State == StateSuccess {
+		return nil
+	}
+	return loginerrors.PasswordResetRequired(b.profile.serviceName)
+}
+
+func (b *Browser) uninformativeLoginError(callsite string) bridgev2.RespError {
+	return loginerrors.Uninformative(b.profile.uninformativeMessage, callsite)
+}
+
+var instagramLoginSafeDiagnosticPattern = regexp.MustCompile(
+	`(?i)(unimplemented function|unexpected new screen|can't handle new screen)\s+([a-z0-9_.-]+)`,
+)
+
+func instagramLoginSubmissionErrorDiagnostic(err error) (kind, detail string) {
+	if err == nil {
+		return "none", ""
+	}
+	var checkpointErr CheckpointError
+	if errors.As(err, &checkpointErr) {
+		return "server_rejection", ""
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "Invalid username or password"):
+		return "invalid_credentials", ""
+	case strings.Contains(message, "isn’t connected to an account") ||
+		strings.Contains(message, "isn't connected to an account"):
+		return "unlinked_identifier", ""
+	case strings.Contains(message, "com.bloks.www.caa.assistive_login_confirmation"):
+		return "invalid_identifier", ""
+	case strings.Contains(message, "unexpected HTTP status 429"):
+		return "rate_limited", ""
+	}
+	match := instagramLoginSafeDiagnosticPattern.FindStringSubmatch(message)
+	if len(match) == 3 {
+		switch strings.ToLower(match[1]) {
+		case "unimplemented function":
+			return "unimplemented_function", match[2]
+		case "unexpected new screen", "can't handle new screen":
+			return "unexpected_screen", match[2]
+		}
+	}
+	return "other", ""
+}
+
+func (b *Browser) stepID(name string) string {
+	return b.profile.stepIDPrefix + "." + name
+}
+
+func (b *Browser) rejectedCodeMessage() string {
+	return b.profile.serviceName + " rejected that code"
+}
+
+func (b *Browser) codeNotSentMessage() string {
+	return "That code was not sent to " + b.profile.serviceName + "; please try again"
+}
+
+type scriptInventory struct {
+	variables map[BloksVariableID]struct{}
+}
+
+func newScriptInventory() *scriptInventory {
+	return &scriptInventory{
+		variables: map[BloksVariableID]struct{}{},
+	}
+}
+
+func (inv *scriptInventory) add(node *BloksScriptNode, interp *Interpreter, visited map[BloksScriptID]struct{}) {
+	if node == nil {
+		return
+	}
+	call, ok := node.Content.(*BloksScriptFuncall)
+	if !ok {
+		return
+	}
+	switch call.Function {
+	case "bk.action.bloks.GetVariable2", "bk.action.bloks.GetVariableWithScope",
+		"bk.action.bloks.WriteLocalState", "bk.action.bloks.WriteGlobalConsistencyStore":
+		if name, ok := literalStringArg(call, 0); ok {
+			inv.variables[BloksVariableID(name)] = struct{}{}
+		}
+	case "bk.action.bloks.GetScript":
+		if name, ok := literalStringArg(call, 0); ok && interp != nil {
+			id := BloksScriptID(name)
+			if _, seen := visited[id]; !seen {
+				visited[id] = struct{}{}
+				if script := interp.Scripts[id]; script != nil {
+					inv.add(script.Body, interp, visited)
+				}
+			}
+		}
+	}
+	for idx := range call.Args {
+		inv.add(&call.Args[idx], interp, visited)
+	}
+}
+
+func literalStringArg(call *BloksScriptFuncall, idx int) (string, bool) {
+	if len(call.Args) <= idx {
+		return "", false
+	}
+	literal, ok := call.Args[idx].Content.(*BloksScriptLiteral)
+	if !ok {
+		return "", false
+	}
+	value, ok := literal.Value().(string)
+	return value, ok
+}
+
+func buttonScriptInventory(button *BloksTreeComponent, interp *Interpreter) *scriptInventory {
+	inv := newScriptInventory()
+	for _, name := range []BloksAttributeID{"on_click", "on_touch_down", "on_touch_up"} {
+		if script := button.GetScript(name); script != nil {
+			inv.add(&script.AST, interp, map[BloksScriptID]struct{}{})
+		}
+	}
+	return inv
+}
+
+func resetPendingCodeSubmissionFlags(button *BloksTreeComponent, interp *Interpreter) int {
+	if button == nil || interp == nil {
+		return 0
+	}
+	reset := 0
+	for id := range buttonScriptInventory(button, interp).variables {
+		if !strings.Contains(strings.ToLower(string(id)), "pending") {
+			continue
+		}
+		if _, ok := interp.LocalVars[id]; ok {
+			interp.LocalVars[id] = BloksLiteralOf(false)
+			reset++
+		}
+		if _, ok := interp.GlobalVars[id]; ok {
+			interp.GlobalVars[id] = BloksLiteralOf(false)
+			reset++
+		}
+	}
+	return reset
+}
+
+func clearTrueFlags(interp *Interpreter, names map[BloksVariableID]struct{}) int {
+	cleared := 0
+	for _, vars := range []map[BloksVariableID]*BloksScriptLiteral{interp.LocalVars, interp.GlobalVars} {
+		for id, value := range vars {
+			if names != nil {
+				if _, ok := names[id]; !ok {
+					continue
+				}
+			}
+			if value == nil {
+				continue
+			}
+			if flag, ok := value.Value().(bool); ok && flag {
+				vars[id] = BloksLiteralOf(false)
+				cleared++
+			}
+		}
+	}
+	return cleared
+}
+
+func copyVariables(vars map[BloksVariableID]*BloksScriptLiteral) map[BloksVariableID]*BloksScriptLiteral {
+	return maps.Clone(vars)
 }
 
 var genericDeviceNetworkInfo = map[string]any{
@@ -375,6 +550,56 @@ var genericDeviceNetworkInfo = map[string]any{
 	"is_wifi":                    1,
 }
 
+func (b *Browser) initialLoginParams() (BloksParamsInner, error) {
+	params := BloksParamsInner{
+		"account_list":           []any{},
+		"blocked_uid":            []any{},
+		"device_id":              b.Bridge.DeviceID,
+		"disable_auto_login":     false,
+		"family_device_id":       b.Bridge.FamilyDeviceID,
+		"show_internal_settings": false,
+		"waterfall_id":           hex.EncodeToString(random.Bytes(16)),
+	}
+	switch b.Config.Platform {
+	case types.MessengerLiteIOS:
+		params["auto_login_interstitial_experiment_group"] = ""
+		params["disable_recursive_auto_login_interstitial"] = true
+		params["is_from_logged_in_switcher"] = false
+		params["layered_homepage_experiment_group"] = "not_in_experiment"
+		params["machine_id"] = b.Bridge.MachineID
+		params["offline_experiment_group"] = "caa_iteration_v2_perf_ls_ios_test_1"
+		params["use_auto_login_interstitial"] = true
+	case types.MessengerLiteAndroid:
+		params["INTERNAL_INFRA_THEME"] = "THREE_NEUTRAL_GRAY"
+		params["device_emails"] = []any{}
+		params["offline_experiment_group"] = "caa_iteration_v3_perf_msg_6"
+		params["openid_tokens"] = map[string]any{}
+		params["spectra_guardian_token"] = ""
+	default:
+		return nil, fmt.Errorf("no initial bloks params for platform %s", b.Config.Platform.String())
+	}
+	return params, nil
+}
+
+func (b *Browser) instagramDirectLoginParams() BloksParamsInner {
+	return BloksParamsInner{
+		"device_id":                  b.Bridge.AndroidDeviceID,
+		"disable_auto_login":         false,
+		"family_device_id":           b.Bridge.FamilyDeviceID,
+		"is_caa_perf_enabled":        true,
+		"is_from_logged_in_switcher": false,
+		"is_from_logged_out":         true,
+		"last_auto_login_time":       int64(0),
+		"logged_out_user":            "",
+		"logout_source":              "",
+		"offline_experiment_group":   "caa_iteration_v3_perf_ig_4",
+		"qe_device_id":               b.Bridge.DeviceID,
+		"qpl_join_id":                nil,
+		"show_internal_settings":     false,
+		"waterfall_id":               uuid.NewString(),
+	}
+}
+
 // You will want an explanation of how to maintain this code.
 //
 // The problem being solved is tricky because Facebook wants to shake their frontend around like a
@@ -392,7 +617,7 @@ var genericDeviceNetworkInfo = map[string]any{
 // an action bundle, we execute it immediately, and just catch up later to see if it did what we
 // were hoping it would.
 //
-// The state starts off in StateInitial, which kicks things off by making a Bloks request manually
+// The state starts off in the platform-specific initial state, which kicks things off by making a Bloks request manually
 // and executing the action that it gets back. When an action is executed, it can trigger further
 // action RPC calls, which can execute further actions. Or it can trigger page RPC calls, which lead
 // to the interpreter invoking DisplayNewScreen, which updates the page state.
@@ -464,9 +689,11 @@ var genericDeviceNetworkInfo = map[string]any{
 // time.
 
 func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
+	profile := browserProfile(cfg.Platform)
 	b := Browser{
-		State:  StateInitial,
-		Config: cfg,
+		State:   profile.initialState,
+		Config:  cfg,
+		profile: profile,
 	}
 	attestationKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -533,6 +760,7 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 			return bundle, nil
 		},
 		DoActionRPC: func(ctx context.Context, name string, params map[string]string) (*BloksScriptNode, error) {
+			b.ActionRPCCount++
 			log := zerolog.Ctx(ctx)
 			log.Debug().Str("state", string(b.State)).Str("rpc", name).Str("rpc_type", "action").Msg("Invoking RPC from Bloks")
 			var paramsInner BloksParamsInner
@@ -579,12 +807,25 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 			switch name {
 			case "com.bloks.www.caa.login.login_homepage":
 				newState = StateEmailPasswordPage
-			case "com.bloks.www.caa.ar.code_entry",
-				"com.bloks.www.ap.two_step_verification.code_entry":
+			case "com.bloks.www.caa.login.landing_screen":
+				newState = StateLandingPage
+			case "com.bloks.www.caa.ar.authentication_confirmation":
+				newState = authenticationConfirmationPageState(page)
+			case "com.bloks.www.caa.ar.select_account",
+				"com.bloks.www.caa.login.aymh_multiple_profiles_screen_entry":
+				newState = StateAccountSelectionPage
+			case "com.bloks.www.caa.login.aymh_single_profile_screen_entry":
+				newState = StateAuthenticationConfirm
+			case "com.bloks.www.caa.ar.code_entry":
+				newState = b.profile.caaCodeEntryState
+			case "com.bloks.www.ap.two_step_verification.code_entry":
 				newState = StateCodeEntryPage
 			case "com.bloks.www.two_step_verification.entrypoint":
-				newState = StateMFALandingPage
-			case "com.bloks.www.two_step_verification.enter_text_captcha_code":
+				newState = b.profile.twoStepEntrypointState(page)
+				b.profile.logTwoStepEntrypoint(log, page, newState)
+			case "com.bloks.www.two_step_verification.enter_text_captcha_code",
+				"com.bloks.www.caa.ar.sms_captcha",
+				"com.bloks.www.ap.anti_scripting.text_captcha":
 				newState = StateCaptchaPage
 			case "com.bloks.www.ap.two_step_verification.approve_from_another_device",
 				"com.bloks.www.two_step_verification.approve_from_another_device":
@@ -604,28 +845,46 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 				"com.bloks.www.two_step_verification.method_picker",
 				"com.bloks.www.caa.ar.initiate_view":
 				newState = StateChooseMFAPage
-			case "com.bloks.www.caa.ar.auth_method", "com.bloks.www.ap.two_step_verification.google_oauth":
+			case "com.bloks.www.caa.ar.auth_method":
+				newState = b.profile.authMethodState
+			case "com.bloks.www.ap.two_step_verification.google_oauth":
 				newState = StateMFALandingPage
-			case "com.bloks.www.two_factor_login.enter_totp_code":
+			case "com.bloks.www.two_factor_login.enter_totp_code",
+				"com.bloks.www.two_step_verification.enter_totp_code",
+				"com.bloks.www.ap.two_step_verification.enter_totp_code":
 				newState = StateTOTPPage
 			case "com.bloks.www.ap.two_step_verification.login_with_third_party":
 				newState = StateOAuthPage
 			case "com.bloks.www.two_step_verification.enter_sms_code":
 				newState = StateSMSPage
-			case "com.bloks.www.two_factor_login.enter_backup_code":
+			case "com.bloks.www.two_factor_login.enter_backup_code",
+				"com.bloks.www.two_step_verification.enter_backup_code",
+				"com.bloks.www.ap.two_step_verification.enter_backup_code":
 				newState = StateBackupCodePage
-			case "com.bloks.www.ap.two_step_verification.contactpoint_chooser":
+			case "com.bloks.www.ap.two_step_verification.contactpoint_chooser",
+				"com.bloks.www.two_step_verification.contactpoint_chooser":
 				newState = StateChooseContactPointPage
 			case "com.bloks.www.approve_from_another_device.xmds.challenged_device_denied":
-				return ErrLoginAFADStopped
+				return loginerrors.AFADStopped
 			case "com.bloks.www.two_step_verification.enter_whatsapp_code":
 				newState = StateWhatsAppPage
 			case "com.bloks.www.ap.passkey_auth":
 				newState = StatePasskeyPage
 			case "com.bloks.www.two_step_verification.no_op_captcha":
 				newState = StateSilentCaptchaPage
-			case "com.bloks.www.two_step_verification.google_recaptcha":
-				return ErrLoginReCaptcha
+			case "com.bloks.www.two_step_verification.google_recaptcha",
+				"com.bloks.www.ap.anti_scripting.recaptcha":
+				newState = StateReCaptchaPage
+			case "com.bloks.www.caa.login.password_as_id_confirmation":
+				newState = StateSuggestedAccountPage
+			case "com.bloks.www.caa.assistive_login_confirmation":
+				if page.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).FindContainingButton() == nil {
+					return fmt.Errorf("unexpected new screen %s", name)
+				}
+				newState = StateSuggestedAccountPage
+			case "com.bloks.www.caa.ar.password_form",
+				"com.bloks.www.caa.login.aymh_password_entry":
+				newState = StatePasswordFormPage
 			default:
 				return fmt.Errorf("unexpected new screen %s", name)
 			}
@@ -639,8 +898,11 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 			}
 
 			b.PreviousPage = b.CurrentPage
+			b.PreviousPageState = b.State
 			b.CurrentPage = page
 			b.State = newState
+			b.PageTransitionCount += 1
+			b.AuthCodeEntryChosen = false
 			return nil
 		},
 		HandleLoginResponse: func(ctx context.Context, data string) error {
@@ -650,11 +912,30 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 			b.State = StateSuccess
 			return nil
 		},
+		ShowLoggedInResetPassword: func(ctx context.Context) error {
+			if !b.profile.isInstagram {
+				return nil
+			}
+			zerolog.Ctx(ctx).Debug().
+				Str("state", string(b.State)).
+				Bool("login_already_handled", b.State == StateSuccess).
+				Msg("Instagram requested the logged-in reset password screen")
+			b.PasswordResetRequested = true
+			return nil
+		},
 		StartTimer: func(name string, interval time.Duration, callback func() error) error {
 			switch name {
 			case "approve_from_another_device_polling_timer":
 				b.AFADInterval = interval
 				b.AFADCallback = callback
+			case "notif_delivery_status_polling":
+				if !b.profile.supportsNotificationTimer {
+					return fmt.Errorf("unexpected timer %s", name)
+				}
+				// Instagram schedules this after sending a phone login
+				// notification. It is delivery-status polling, not the
+				// authentication continuation itself, so there is no work for
+				// the bridge to schedule.
 			default:
 				return fmt.Errorf("unexpected timer %s", name)
 			}
@@ -662,9 +943,14 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 		},
 		CancelTimer: func(name string) error {
 			switch name {
+			case "wa_retriever":
 			case "approve_from_another_device_polling_timer":
 				b.AFADInterval = 0
 				b.AFADCallback = nil
+			case "notif_delivery_status_polling":
+				if !b.profile.supportsNotificationTimer {
+					return fmt.Errorf("unexpected timer cancel %s", name)
+				}
 			default:
 				return fmt.Errorf("unexpected timer cancel %s", name)
 			}
@@ -672,6 +958,36 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 		},
 		OpenURL: func(url string) error {
 			b.DisplayedURL = url
+			return nil
+		},
+		OpenDialog: func(ctx context.Context, dialog *BloksDialog) error {
+			if dialog == nil {
+				return fmt.Errorf("can't open a nil dialog")
+			}
+			if b.PendingDialog != nil {
+				return fmt.Errorf("can't open a second dialog while one is pending")
+			}
+			zerolog.Ctx(ctx).Debug().
+				Str("state", string(b.State)).
+				Str("dialog_title", dialog.Title).
+				Str("dialog_message", dialog.Message).
+				Int("button_count", len(dialog.Buttons)).
+				Msg("Displaying native Bloks dialog")
+			b.DialogPreviousState = b.State
+			b.PendingDialog = dialog
+			b.State = StateDialog
+			return nil
+		},
+		PopScreen: func(ctx context.Context, style string) error {
+			if b.PreviousPage == nil || b.PreviousPageState == StateUnknown {
+				return fmt.Errorf("can't pop screen without page history")
+			}
+			zerolog.Ctx(ctx).Debug().
+				Str("state", string(b.State)).
+				Str("style", style).
+				Msg("Popping native Bloks screen")
+			b.CurrentPage, b.PreviousPage = b.PreviousPage, b.CurrentPage
+			b.State, b.PreviousPageState = b.PreviousPageState, b.State
 			return nil
 		},
 		HandleVariableChange: func(ctx context.Context, name string, value *BloksScriptLiteral) error {
@@ -691,7 +1007,7 @@ func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 				}
 				b.LastError = msg
 			case "BLOKS_AUTH_PLATFORM_ENTER_CODE:error_message":
-				if b.State != StateCodeEntryPage {
+				if b.State != StateCodeEntryPage && b.State != StateAuthenticationCodePage {
 					break
 				}
 				msg, ok := value.Value().(string)
@@ -733,7 +1049,7 @@ var initiateViewMethods = map[string]string{
 	"Get code or link via WhatsApp": "WhatsApp",
 	"Get code via email":            "Email",
 	"Get code via SMS":              "Text message",
-	"Enter password to log in":      "",
+	"Enter password to log in":      "Re-enter password",
 	"Log into another account":      "",
 }
 
@@ -741,11 +1057,25 @@ var initiateViewMethods = map[string]string{
 // canonical name, the names in display order, and how many recognised but
 // unsupported methods were skipped.
 func (bb *BloksBundle) FindMFAMethods(log *zerolog.Logger) (map[string]*BloksTreeComponent, []string, int) {
+	if bb.FindDescendant(func(comp *BloksTreeComponent) bool {
+		if comp.ComponentID != "bk.data.TextSpan" {
+			return false
+		}
+		return strings.HasPrefix(comp.GetAttribute("text"), "Your session expired")
+	}) != nil {
+		log.Error().Msg("Got session expired warning on MFA screen")
+	}
+
 	foundMethods := map[string]*BloksTreeComponent{}
 	methodNames := []string{}
 	numIgnored := 0
 
-	if bb.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Choose a way to log in.")) != nil {
+	if bb.FindDescendant(func(comp *BloksTreeComponent) bool {
+		if comp.ComponentID != "bk.data.TextSpan" {
+			return false
+		}
+		return strings.HasPrefix(comp.GetAttribute("text"), "Choose a way to log in")
+	}) != nil {
 		for _, span := range bb.FindDescendants(FilterByComponent("bk.data.TextSpan")) {
 			label := span.GetAttribute("text")
 			method, isMethod := initiateViewMethods[label]
@@ -790,22 +1120,7 @@ func (bb *BloksBundle) FindMFAMethods(log *zerolog.Logger) (map[string]*BloksTre
 }
 
 func (b *Browser) getCodeInstructions() string {
-	return b.CurrentPage.
-		FindDescendant(func(comp *BloksTreeComponent) bool {
-			if comp.ComponentID != "bk.data.TextSpan" {
-				return false
-			}
-			for _, prefix := range []string{
-				"Enter the code",
-				"We sent a code",
-			} {
-				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
-					return true
-				}
-			}
-			return false
-		}).
-		GetAttribute("text")
+	return b.profile.codeInstructions(b.CurrentPage)
 }
 
 func (b *Browser) getContactPointInstructions() string {
@@ -820,6 +1135,51 @@ func (b *Browser) getContactPointInstructions() string {
 		GetAttribute("text")
 }
 
+const dialogActionFieldID = "dialog_action"
+
+func pendingDialogInstructions(dialog *BloksDialog, service string) string {
+	if dialog == nil {
+		return service + " requires a confirmation."
+	}
+	parts := make([]string, 0, 2)
+	if title := strings.TrimSpace(dialog.Title); title != "" {
+		parts = append(parts, title)
+	}
+	if message := strings.TrimSpace(dialog.Message); message != "" {
+		parts = append(parts, message)
+	}
+	if len(parts) == 0 {
+		return service + " requires a confirmation."
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func pendingDialogOptions(dialog *BloksDialog) ([]string, map[string]*BloksDialogButton) {
+	options := make([]string, 0, len(dialog.Buttons))
+	buttons := make(map[string]*BloksDialogButton, len(dialog.Buttons))
+	for idx := range dialog.Buttons {
+		button := &dialog.Buttons[idx]
+		label := strings.TrimSpace(button.Label)
+		if label == "" {
+			switch button.Role {
+			case "positive":
+				label = "Continue"
+			case "negative":
+				label = "Cancel"
+			default:
+				label = "Other"
+			}
+		}
+		option := label
+		if _, exists := buttons[option]; exists {
+			option = fmt.Sprintf("%s (%s)", label, button.Role)
+		}
+		options = append(options, option)
+		buttons[option] = button
+	}
+	return options, buttons
+}
+
 func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) (step *bridgev2.LoginStep, err error) {
 	log := zerolog.Ctx(ctx)
 	{
@@ -830,13 +1190,56 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		log.Debug().Str("cur_state", string(b.State)).Strs("user_input", fields).Msg("Executing login step")
 	}
 	prevState := b.State
+	prevPageTransitionCount := b.PageTransitionCount
 	switch b.State {
+
+	case StateDialog:
+		dialog := b.PendingDialog
+		if dialog == nil {
+			return nil, fmt.Errorf("dialog state has no pending dialog")
+		}
+		options, buttons := pendingDialogOptions(dialog)
+		if len(options) == 0 {
+			return nil, fmt.Errorf("native dialog has no actions")
+		}
+		selected := userInput[dialogActionFieldID]
+		if selected == "" {
+			step = &bridgev2.LoginStep{
+				Type:         bridgev2.LoginStepTypeUserInput,
+				StepID:       b.stepID("dialog"),
+				Instructions: pendingDialogInstructions(dialog, b.profile.serviceName),
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{{
+						ID:           dialogActionFieldID,
+						Name:         "Continue login",
+						Type:         bridgev2.LoginInputFieldTypeSelect,
+						DefaultValue: options[0],
+						Options:      options,
+					}},
+				},
+			}
+			break
+		}
+		log.Info().Str("dialog_action", selected).Msg("Picked option from dialog")
+		button := buttons[selected]
+		if button == nil {
+			return nil, fmt.Errorf("unknown dialog action")
+		}
+		delete(userInput, dialogActionFieldID)
+		b.PendingDialog = nil
+		b.State = b.DialogPreviousState
+		b.DialogPreviousState = StateUnknown
+		if button.Callback != nil {
+			if err = button.Callback(ctx); err != nil {
+				return nil, fmt.Errorf("executing dialog action: %w", err)
+			}
+		}
 
 	case StateTestCaptcha:
 		if userInput["captcha_code"] == "" {
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.captcha",
+				StepID:       b.stepID("captcha"),
 				Instructions: "Here is a test captcha",
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Attachments: []*bridgev2.LoginUserInputAttachment{
@@ -867,40 +1270,38 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			break
 		}
-		b.State = StateInitial
+		b.State = b.profile.initialState
 
-	case StateInitial:
+	case StateInitialInstagram:
+		rpc := "com.bloks.www.caa.login.login_homepage"
+		appDoc, err := GetBloksAppDoc(b.Config.Platform)
+		if err != nil {
+			return nil, fmt.Errorf("initial request: %w", err)
+		}
+		page, err := b.Config.MakeBloksRequest(
+			ctx,
+			appDoc,
+			rpc,
+			b.instagramDirectLoginParams(),
+			b.Bridge.DeviceID,
+			b.Bridge.FamilyDeviceID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("rpc %s: %w", rpc, err)
+		}
+		if err = b.Bridge.DisplayNewScreen(ctx, rpc, page); err != nil {
+			return nil, fmt.Errorf("displaying initial Instagram login screen: %w", err)
+		}
+
+	case StateInitialMessenger:
 		rpc := "com.bloks.www.bloks.caa.login.process_client_data_and_redirect"
 		actionDoc, err := GetBloksActionDoc(b.Config.Platform)
 		if err != nil {
 			return nil, fmt.Errorf("initial request: %w", err)
 		}
-		params := BloksParamsInner{
-			"account_list":           []any{},
-			"blocked_uid":            []any{},
-			"device_id":              b.Bridge.DeviceID,
-			"disable_auto_login":     false,
-			"family_device_id":       b.Bridge.FamilyDeviceID,
-			"show_internal_settings": false,
-			"waterfall_id":           hex.EncodeToString(random.Bytes(16)),
-		}
-		switch b.Config.Platform {
-		case types.MessengerLiteIOS:
-			params["auto_login_interstitial_experiment_group"] = ""
-			params["disable_recursive_auto_login_interstitial"] = true
-			params["is_from_logged_in_switcher"] = false
-			params["layered_homepage_experiment_group"] = "not_in_experiment"
-			params["machine_id"] = b.Bridge.MachineID
-			params["offline_experiment_group"] = "caa_iteration_v2_perf_ls_ios_test_1"
-			params["use_auto_login_interstitial"] = true
-		case types.MessengerLiteAndroid:
-			params["INTERNAL_INFRA_THEME"] = "THREE_NEUTRAL_GRAY"
-			params["device_emails"] = []any{}
-			params["offline_experiment_group"] = "caa_iteration_v3_perf_msg_6"
-			params["openid_tokens"] = map[string]any{}
-			params["spectra_guardian_token"] = ""
-		default:
-			return nil, fmt.Errorf("no initial bloks params for platform %s", b.Config.Platform.String())
+		params, err := b.initialLoginParams()
+		if err != nil {
+			return nil, fmt.Errorf("initial request: %w", err)
 		}
 		action, err := b.Config.MakeBloksRequest(ctx, actionDoc, rpc, params, b.Bridge.DeviceID, b.Bridge.FamilyDeviceID)
 		if err != nil {
@@ -922,18 +1323,31 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			return nil, fmt.Errorf("initial action: %w", err)
 		}
 
+	case StateLandingPage:
+		existingProfile := b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "I already have a profile")).
+			FindContainingButton()
+		if existingProfile == nil {
+			return nil, errors.New("couldn't find the existing profile button")
+		}
+		err = existingProfile.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping existing Instagram profile button: %w", err)
+		}
+
 	case StateEmailPasswordPage:
 		username := userInput["username"]
 		password := userInput["password"]
 		if username == "" || password == "" {
-			instructions := "Enter your Facebook credentials. The Messenger network will only work with Facebook accounts."
+			instructions := b.profile.credentialsInstruction
+			stepID := b.stepID("email_password")
 			if b.LastError != "" {
 				instructions = fmt.Sprintf("%s. %s", b.LastError, instructions)
 				b.LastError = ""
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.email_password",
+				StepID:       stepID,
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{
@@ -946,16 +1360,16 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		}
 
 		if !definitelyNotPhoneNumberRegexp.MatchString(username) {
-			return nil, ErrLoginPhoneNumber
+			return nil, loginerrors.PhoneNumber
 		}
 		if strings.Contains(username, ":") { // covers MXIDs
-			return nil, ErrLoginInvalidUsername
+			return nil, b.profile.errors.InvalidUsername
 		}
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "username")
 		delete(userInput, "password")
-		b.LastError = "Facebook rejected that login"
+		b.LastError = b.profile.loginRejected
 
 		err = b.CurrentPage.
 			FindDescendant(FilterByAttribute("bk.components.TextInput", "html_name", "email")).
@@ -976,8 +1390,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			FindContainingButton().
 			TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
-			log.Debug().Err(err).Msg("Got error from username/password submission")
-			if strings.Contains(err.Error(), "Invalid username or password") {
+			errorKind, safeDetail := instagramLoginSubmissionErrorDiagnostic(err)
+			b.profile.logCredentialSubmissionError(log, err, errorKind, safeDetail)
+			if b.profile.isCheckpointRejection(err) {
+				b.LastError = b.profile.loginRejected
+			} else if strings.Contains(err.Error(), "Invalid username or password") {
 				b.LastError = "Invalid username or password"
 			} else if strings.Contains(err.Error(), "isn’t connected to an account") || strings.Contains(err.Error(), "isn't connected to an account") {
 				// Note matching both unicode + ASCII apostrophe - unicode appears to be what Meta uses
@@ -985,7 +1402,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				if strings.Contains(username, "@") {
 					thing = "email address"
 				}
-				b.LastError = fmt.Sprintf("That %s is not connected to a Messenger account", thing)
+				b.LastError = fmt.Sprintf("That %s is not connected to a %s account", thing, b.profile.serviceName)
 			} else if strings.Contains(err.Error(), "com.bloks.www.caa.assistive_login_confirmation") {
 				// Facebook tries to send us to this screen when they think we are
 				// demonstrating substantial incompetence at entering an email
@@ -997,29 +1414,194 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				// comes up, but it's the only one sighted thus far. Update this if
 				// something new is discovered.
 				b.LastError = "Invalid email address"
+			} else if errorKind == "rate_limited" {
+				return nil, loginerrors.RateLimited
 			} else {
-				return nil, fmt.Errorf("tapping login button: %w", err)
+				return nil, b.profile.unhandledCredentialError(err, errorKind, safeDetail)
 			}
 		}
 
-	case StateCodeEntryPage:
-		otpCode := userInput["otp_code"]
-		if otpCode == "" {
-			instructions := b.getCodeInstructions()
+	case StateAuthenticationConfirm:
+		if state := authenticationConfirmationPageState(b.CurrentPage); state != StateAuthenticationConfirm {
+			b.State = state
+			break
+		}
+		btn, clickableTextCount := findAuthenticationConfirmationButton(b.CurrentPage)
+		if btn == nil && b.profile.isInstagram &&
+			b.CurrentPage.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Check your SMS")) != nil {
+			btn = b.CurrentPage.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).FindContainingButton()
+			if btn != nil {
+				if err = ctx.Err(); err != nil {
+					return nil, err
+				}
+				choice := userInput["confirmation_action"]
+				if choice == "" {
+					instructions := "Instagram sent a sign-in link by SMS. To use a different verification method, choose Try another way."
+					if b.LastError != "" {
+						instructions = b.LastError + " " + instructions
+						b.LastError = ""
+					}
+					step = &bridgev2.LoginStep{
+						Type:         bridgev2.LoginStepTypeUserInput,
+						StepID:       b.stepID("confirmation_action"),
+						Instructions: instructions,
+						UserInputParams: &bridgev2.LoginUserInputParams{
+							Fields: []bridgev2.LoginInputDataField{{
+								ID: "confirmation_action", Name: "Verification method", Type: bridgev2.LoginInputFieldTypeSelect,
+								Options: []string{"Try another way"},
+							}},
+						},
+					}
+					break
+				}
+				if choice != "Try another way" {
+					return nil, fmt.Errorf("invalid authentication confirmation action")
+				}
+				delete(userInput, "confirmation_action")
+				b.LastError = "Instagram did not advance to another verification method."
+			}
+		}
+		if btn == nil {
+			return nil, fmt.Errorf(
+				"couldn't find authentication confirmation action (clickable_text_count=%d)",
+				clickableTextCount,
+			)
+		}
+		err = btn.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping authentication confirmation button: %w", err)
+		}
+
+	case StateAccountSelectionPage:
+		foundAccounts, accountNames, clickableTextCount := findAccountSelectionOptions(b.CurrentPage)
+		if len(accountNames) == 0 {
+			return nil, fmt.Errorf(
+				"couldn't find accounts on account selection page (clickable_text_count=%d)",
+				clickableTextCount,
+			)
+		}
+
+		selectedAccount := userInput["account"]
+		if selectedAccount == "" && len(accountNames) == 1 {
+			selectedAccount = accountNames[0]
+		}
+		if selectedAccount == "" {
+			step = &bridgev2.LoginStep{
+				Type:         bridgev2.LoginStepTypeUserInput,
+				StepID:       b.stepID("account_selection"),
+				Instructions: b.profile.accountSelection,
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{
+						{
+							ID: "account", Name: "Instagram account", Type: bridgev2.LoginInputFieldTypeSelect,
+							Options: accountNames,
+						},
+					},
+				},
+			}
+			break
+		}
+		log.Info().Str("account", selectedAccount).Msg("Picked account from account selection page")
+
+		selectedButton := foundAccounts[selectedAccount]
+		if selectedButton == nil {
+			return nil, errors.New("invalid account selection")
+		}
+		delete(userInput, "account")
+		err = selectedButton.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping selected account: %w", err)
+		}
+
+	case StateAccountRecoveryPage:
+		return nil, b.profile.errors.AccountRecovery
+
+	case StatePasswordFormPage:
+		password := userInput["password"]
+		if password == "" {
+			instructions := fmt.Sprintf("Re-enter your %s password.", b.profile.serviceName)
 			if b.LastError != "" {
 				instructions = fmt.Sprintf(
 					"%s. %s", strings.TrimSuffix(b.LastError, "."), instructions,
 				)
 				b.LastError = ""
 			}
-
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.otp_code",
+				StepID:       b.stepID("password"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{
-						{ID: "otp_code", Name: "One-time code sent to you", Type: bridgev2.LoginInputFieldType2FACode},
+						{ID: "password", Name: "Password", Type: bridgev2.LoginInputFieldTypePassword},
+					},
+				},
+			}
+			break
+		}
+
+		delete(userInput, "password")
+		b.LastError = b.profile.loginRejected
+
+		err = b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.components.TextInput", "html_name", "password")).
+			FillInput(ctx, b.CurrentPage.Interpreter, password)
+		if err != nil {
+			return nil, fmt.Errorf("filling password input: %w", err)
+		}
+
+		err = b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Log in")).
+			FindContainingButton().
+			TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			if strings.Contains(err.Error(), "Invalid username or password") {
+				b.LastError = "The password you entered is incorrect"
+			} else {
+				return nil, fmt.Errorf("tapping password form log in button: %w", err)
+			}
+		}
+
+	case StateCodeEntryPage, StateAuthenticationCodePage:
+		codeState := b.State
+		if codeState == StateAuthenticationCodePage && b.profile.isInstagram {
+			var handled bool
+			step, handled, err = b.handleAuthenticationCodeOptions(ctx, userInput)
+			if err != nil {
+				return nil, err
+			} else if handled {
+				break
+			}
+		}
+		otpCode := userInput["otp_code"]
+		if otpCode == "" {
+			instructions := ""
+			if codeState == StateAuthenticationCodePage && b.profile.isInstagram {
+				instructions = authenticationCodeInstructions(b.CurrentPage)
+			}
+			if instructions == "" {
+				instructions = b.getCodeInstructions()
+			}
+			if instructions == "" {
+				instructions = b.profile.codeInstruction
+			}
+			if b.LastError != "" {
+				instructions = fmt.Sprintf(
+					"%s. %s", strings.TrimSuffix(b.LastError, "."), instructions,
+				)
+				b.LastError = ""
+			}
+			step = &bridgev2.LoginStep{
+				Type:         bridgev2.LoginStepTypeUserInput,
+				StepID:       b.stepID("otp_code"),
+				Instructions: instructions,
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					CanCancel: b.MFACanGoBack || (codeState == StateAuthenticationCodePage && b.AuthCodeEntryChosen),
+					Fields: []bridgev2.LoginInputDataField{
+						{
+							ID:   "otp_code",
+							Name: b.profile.codeFieldName,
+							Type: bridgev2.LoginInputFieldType2FACode,
+						},
 					},
 				},
 			}
@@ -1028,7 +1610,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "otp_code")
-		b.LastError = "Facebook rejected that code"
+		b.LastError = b.rejectedCodeMessage()
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1039,28 +1621,39 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 					"bk.components.AccessibilityExtension", "label", "Enter code",
 				)) != nil
 			})
-		if input == nil {
-			input = b.CurrentPage.FindDescendant(FilterByComponent("bk.components.TextInput"))
-		}
+		input = b.profile.fallbackCodeInput(b.CurrentPage, input)
+
+		continueButton := b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+			FindContainingButton()
+		b.profile.prepareCodeSubmission(b, continueButton, log, "code-submission")
+
 		err := input.FillInput(ctx, b.CurrentPage.Interpreter, otpCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling otp code input: %w", err)
 		}
 
-		err = b.CurrentPage.
-			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
-			FindContainingButton().
-			TapButton(ctx, b.CurrentPage.Interpreter)
+		actionRPCCountBefore := b.ActionRPCCount
+		err = continueButton.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err == nil {
+			err = b.profile.retryStalledCodeSubmission(
+				ctx, b, input, continueButton, otpCode, codeState, actionRPCCountBefore, log,
+			)
+		}
 		if err != nil {
 			log.Debug().Err(err).Msg("Got error from OTP code submission")
+			if resetErr := b.passwordResetRequiredError(); resetErr != nil {
+				return nil, resetErr
+			}
 			if strings.Contains(err.Error(), "Please re-enter") {
 				// retry
 			} else if strings.Contains(err.Error(), "An unexpected error occurred") {
-				return nil, ErrLoginUninformative("otp submit unexpected error")
+				return nil, b.uninformativeLoginError("otp submit unexpected error")
 			} else {
 				return nil, fmt.Errorf("tapping continue: %w", err)
 			}
 		}
+		b.profile.finishCodeSubmission(b, codeState, actionRPCCountBefore)
 
 	case StateBackupCodePage:
 		backupCode := userInput["backup_code"]
@@ -1075,9 +1668,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.backup_code",
+				StepID:       b.stepID("backup_code"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
+					CanCancel: b.MFACanGoBack,
 					Fields: []bridgev2.LoginInputDataField{
 						{ID: "backup_code", Name: "Backup code", Type: bridgev2.LoginInputFieldType2FACode},
 					},
@@ -1088,7 +1682,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "backup_code")
-		b.LastError = "Facebook rejected that code"
+		b.LastError = b.rejectedCodeMessage()
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1131,7 +1725,12 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			log.Trace().Str("image_url", imageURL).Msg("Found image captcha")
 
-			audio := b.CurrentPage.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "play audio"))
+			audio := b.CurrentPage.FindDescendant(func(comp *BloksTreeComponent) bool {
+				if comp.ComponentID != "bk.data.TextSpan" {
+					return false
+				}
+				return strings.EqualFold(comp.GetAttribute("text"), "play audio")
+			})
 			if audio == nil {
 				return nil, fmt.Errorf("can't find audio text")
 			}
@@ -1143,6 +1742,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			if onClick == nil {
 				return nil, fmt.Errorf("no on_click on audio text")
 			}
+			b.DisplayedURL = ""
 			_, err := b.CurrentPage.Interpreter.Evaluate(ctx, &onClick.AST)
 			if err != nil {
 				return nil, fmt.Errorf("clicking on audio text: %w", err)
@@ -1178,13 +1778,13 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				imageHeight = imageMeta.Height
 			}
 
-			instructions := "Facebook requires solving a captcha"
+			instructions := b.profile.serviceName + " requires solving a captcha"
 			if b.LastError != "" {
 				instructions = b.LastError
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.captcha",
+				StepID:       b.stepID("captcha"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Attachments: []*bridgev2.LoginUserInputAttachment{
@@ -1219,7 +1819,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "captcha_code")
-		b.LastError = "Facebook rejected that captcha solution"
+		b.LastError = b.profile.serviceName + " rejected that captcha solution"
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1251,7 +1851,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			// produces a different, non-error response - so we know there is nothing
 			// the user could do to cause this, it is purely Meta's fault.
 			if strings.Contains(err.Error(), "Query Error") {
-				return nil, ErrLoginUninformative("captcha submit query error")
+				return nil, b.uninformativeLoginError("captcha submit query error")
 			}
 			// Sometimes just for spice, they will throw you a "Wrong Credentials" /
 			// "Invalid username or password" error here, even though what you submitted
@@ -1260,16 +1860,66 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			// wrong password, it would have errored out at the password step, if we get
 			// the same error here, it means the Zuck says no.
 			if strings.Contains(err.Error(), "Invalid username or password") {
-				return nil, ErrLoginUninformative("captcha submit invalid username/password")
+				return nil, b.uninformativeLoginError("captcha submit invalid username/password")
 			}
 			// Another kind of lie that we can get from Facebook.
 			if strings.Contains(err.Error(), "An unexpected error occurred") {
-				return nil, ErrLoginUninformative("captcha submit unexpected error")
+				return nil, b.uninformativeLoginError("captcha submit unexpected error")
 			}
 			return nil, fmt.Errorf("tapping continue: %w", err)
 		}
 
+	case StateReCaptchaPage:
+		webview := b.CurrentPage.FindDescendantIncludingEmbedded(FilterByComponent("webview"))
+		if webview == nil {
+			return nil, fmt.Errorf("can't find reCAPTCHA webview")
+		}
+		token := userInput["recaptcha_token"]
+		if token == "" {
+			url := webview.GetDynamicAttribute(ctx, b.CurrentPage.Interpreter, "url")
+			if url == "" {
+				return nil, fmt.Errorf("reCAPTCHA webview has no URL")
+			}
+			step = &bridgev2.LoginStep{
+				Type:         bridgev2.LoginStepTypeCookies,
+				StepID:       b.stepID("recaptcha"),
+				Instructions: "Complete the Google reCAPTCHA challenge.",
+				CookiesParams: &bridgev2.LoginCookiesParams{
+					URL: url,
+					Fields: []bridgev2.LoginCookieField{{
+						ID:       "recaptcha_token",
+						Required: true,
+						Sources:  []bridgev2.LoginCookieFieldSource{{Type: bridgev2.LoginCookieTypeSpecial, Name: "recaptcha_token"}},
+					}},
+					ExtractJS: `new Promise((resolve, reject) => {
+						window.FbLoginRecaptcha = {
+							onRecaptcha: data => {
+								try {
+									resolve({recaptcha_token: JSON.parse(data)["g-recaptcha-response"]});
+								} catch (err) {
+									reject(err);
+								}
+							}
+						}
+					})`,
+				},
+			}
+			break
+		}
+		callback := webview.GetScript("callback")
+		if callback == nil {
+			return nil, fmt.Errorf("reCAPTCHA webview has no callback")
+		}
+		delete(userInput, "recaptcha_token")
+		if _, err = b.CurrentPage.Interpreter.Evaluate(InterpBindArgs(ctx, token), &callback.AST); err != nil {
+			return nil, fmt.Errorf("submitting reCAPTCHA token: %w", err)
+		}
+
 	case StateMFALandingPage:
+		if b.profile.hasMFAMethodsOnLanding(b.CurrentPage) {
+			b.State = StateChooseMFAPage
+			break
+		}
 		btn := b.CurrentPage.
 			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).
 			FindContainingButton()
@@ -1287,13 +1937,16 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		}
 
 	case StateChooseMFAPage:
-		foundMethods, methodNames, numIgnored := b.CurrentPage.FindMFAMethods(log)
+		foundMethods, methodNames, numIgnored := b.profile.findMFAMethods(b.CurrentPage, log)
+		b.MFACanGoBack = false
 
 		if len(foundMethods) == 0 {
-			if numIgnored == 0 {
-				return nil, fmt.Errorf("couldn't find any mfa types at all")
+			if numIgnored > 0 {
+				return nil, b.profile.errors.NoSupportedMFA
+			} else if b.PreviousPageState == StatePasskeyPage {
+				return nil, b.profile.errors.MandatoryPasskey
 			}
-			return nil, ErrLoginNoSupportedMFA
+			return nil, fmt.Errorf("couldn't find any mfa types at all")
 		}
 
 		chosenMethod := userInput["mfatype"]
@@ -1303,7 +1956,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		if chosenMethod == "" {
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.mfa_type",
+				StepID:       b.stepID("mfa_type"),
 				Instructions: "Choose how to finish signing in",
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{
@@ -1316,16 +1969,21 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			break
 		}
+		log.Info().Str("mfatype", chosenMethod).Msg("Picked MFA method from MFA selection page")
 
 		if foundMethods[chosenMethod] == nil {
-			return nil, fmt.Errorf("not a valid mfa method: %s", chosenMethod)
+			return nil, b.profile.invalidMFAMethodError(chosenMethod)
 		}
 
 		err := foundMethods[chosenMethod].
 			FindContainingButton().
 			TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
-			return nil, fmt.Errorf("tapping %q button: %w", chosenMethod, err)
+			return nil, b.profile.mfaMethodTapError(chosenMethod, err)
+		}
+		b.MFACanGoBack = len(foundMethods) > 1
+		if !b.profile.shouldContinueAfterMFAMethod(b.State) {
+			break
 		}
 
 		err = b.CurrentPage.
@@ -1348,9 +2006,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.totp",
+				StepID:       b.stepID("totp"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
+					CanCancel: b.MFACanGoBack,
 					Fields: []bridgev2.LoginInputDataField{
 						{ID: "totp_code", Name: "Six-digit code", Type: bridgev2.LoginInputFieldType2FACode},
 					},
@@ -1361,7 +2020,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "totp_code")
-		b.LastError = "Facebook rejected that code"
+		b.LastError = b.rejectedCodeMessage()
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1382,19 +2041,24 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 					return comp.GetAttribute("type") == "number"
 				})
 		}
+		input = b.profile.fallbackCodeInput(b.CurrentPage, input)
+
+		continueButton := b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+			FindContainingButton()
+		b.profile.prepareCodeSubmission(b, continueButton, log, "TOTP-submission")
 
 		err := input.FillInput(ctx, b.CurrentPage.Interpreter, totpCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling mfa code input: %w", err)
 		}
 
-		err = b.CurrentPage.
-			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
-			FindContainingButton().
-			TapButton(ctx, b.CurrentPage.Interpreter)
+		actionRPCCountBefore := b.ActionRPCCount
+		err = continueButton.TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
 			return nil, fmt.Errorf("tapping continue: %w", err)
 		}
+		b.profile.finishCodeSubmission(b, StateTOTPPage, actionRPCCountBefore)
 
 	case StateAFADPage:
 		notif := b.CurrentPage.FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1406,6 +2070,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				"We sent a",
 				"Open the notification",
 				"You need to sign in on",
+				"Check your notifications",
 			} {
 				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
 					return true
@@ -1442,10 +2107,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		// Only display the login step once, keep polling in background
 		step = &bridgev2.LoginStep{
 			Type:         bridgev2.LoginStepTypeDisplayAndWait,
-			StepID:       "fi.mau.meta.messengerlite.afad_wait",
+			StepID:       b.stepID("afad_wait"),
 			Instructions: b.AFADNotification,
 			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
-				Type: bridgev2.LoginDisplayTypeNothing,
+				Type:      bridgev2.LoginDisplayTypeNothing,
+				CanCancel: b.MFACanGoBack,
 			},
 		}
 		b.State = StateAFADPageWaiting
@@ -1453,12 +2119,21 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 	case StateAFADPageWaiting:
 		for b.State == StateAFADPageWaiting {
 			if b.AFADCallback == nil {
-				return nil, ErrLoginAFADStopped
+				return nil, loginerrors.AFADStopped
 			}
-			time.Sleep(b.AFADInterval)
+			select {
+			case <-time.After(b.AFADInterval):
+			case <-ctx.Done():
+				if errors.Is(context.Cause(ctx), bridgev2.ErrLoginStepCancelled) {
+					return nil, bridgev2.ErrLoginStepCancelled
+				}
+				return nil, fmt.Errorf("login cancelled while waiting for approval: %w", ctx.Err())
+			}
 			err := b.AFADCallback()
 			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
+				if errors.Is(context.Cause(ctx), bridgev2.ErrLoginStepCancelled) {
+					return nil, bridgev2.ErrLoginStepCancelled
+				} else if ctxErr := ctx.Err(); ctxErr != nil {
 					return nil, fmt.Errorf("login cancelled while waiting for approval: %w", ctxErr)
 				}
 				return nil, fmt.Errorf("AFAD callback: %w", err)
@@ -1466,7 +2141,59 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		}
 
 	case StateOAuthPage:
-		return nil, ErrLoginMandatoryOAuth
+		oauthButton := b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Verify with Google")).
+			FindContainingButton()
+		if oauthButton == nil {
+			return nil, fmt.Errorf("couldn't find verify with Google button")
+		}
+
+		oauthRedirectURL := userInput["oauth_token"]
+		if oauthRedirectURL != "" {
+			delete(userInput, "oauth_token")
+			zerolog.Ctx(ctx).Debug().
+				Str("oauth_redirect_url", oauthRedirectURL).
+				Msg("Google OAuth reached the Meta redirect URL")
+			return nil, fmt.Errorf("google sign-in not yet fully implemented")
+		}
+
+		b.DisplayedURL = ""
+		err = oauthButton.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping verify: %w", err)
+		}
+
+		if b.DisplayedURL == "" {
+			return nil, fmt.Errorf("oauth button failed to open url")
+		}
+
+		step = &bridgev2.LoginStep{
+			Type:         bridgev2.LoginStepTypeCookies,
+			StepID:       "fi.mau.meta.messengerlite.google_oauth",
+			Instructions: "Sign in with your Google account.",
+			CookiesParams: &bridgev2.LoginCookiesParams{
+				URL: b.DisplayedURL,
+				Fields: []bridgev2.LoginCookieField{{
+					ID:       "oauth_token",
+					Required: true,
+					Sources:  []bridgev2.LoginCookieFieldSource{{Type: bridgev2.LoginCookieTypeSpecial, Name: "oauth_token"}},
+				}},
+				ExtractJS: `new Promise((resolve, reject) => {
+					const url = new URL(window.location.href);
+					const isMetaHost = ["m.facebook.com", "www.facebook.com", "web.facebook.com"].includes(url.hostname);
+					if (!isMetaHost || url.pathname !== "/oauth2/redirect/") {
+						return;
+					}
+					const fragment = new URLSearchParams(url.hash.slice(1));
+					const error = url.searchParams.get("error") || fragment.get("error");
+					if (error) {
+						reject(new Error("Google OAuth failed: " + error));
+						return;
+					}
+					resolve({oauth_token: window.location.href});
+				})`,
+			},
+		}
 
 	case StateSMSPage:
 		for _, mount := range b.CurrentPage.FindDescendants(FilterByComponent("bk.components.OnMount")) {
@@ -1477,7 +2204,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			_, err := b.CurrentPage.Interpreter.Evaluate(InterpBindThis(ctx, mount), &script.AST)
 			if err != nil {
 				if strings.Contains(err.Error(), "We can't send a code right now") {
-					return nil, ErrLoginNoSMSAvailable
+					return nil, b.profile.errors.NoSMSAvailable
 				}
 				return nil, fmt.Errorf("sms on_mount script: %w", err)
 			}
@@ -1526,7 +2253,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		if smsCode == "" {
 			instructions := b.getCodeInstructions()
 			if instructions == "" {
-				instructions = "Enter the SMS code sent to your phone number"
+				instructions = b.profile.smsInstruction
 			}
 			if b.LastError != "" {
 				instructions = fmt.Sprintf(
@@ -1536,9 +2263,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.sms",
+				StepID:       b.stepID("sms"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
+					CanCancel: b.MFACanGoBack,
 					Fields: []bridgev2.LoginInputDataField{
 						{ID: "sms_code", Name: "Six-digit code", Type: bridgev2.LoginInputFieldType2FACode},
 					},
@@ -1549,7 +2277,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "sms_code")
-		b.LastError = "Facebook rejected that code"
+		b.LastError = b.rejectedCodeMessage()
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1613,11 +2341,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		if contactPoint == "" {
 			instructions := b.getContactPointInstructions()
 			if instructions == "" {
-				instructions = "Choose where to receive an MFA code"
+				instructions = b.profile.contactPointInstruction
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.choose_contact_point",
+				StepID:       b.stepID("choose_contact_point"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{
@@ -1630,9 +2358,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			break
 		}
+		log.Info().Str("contact_point", contactPoint).Msg("Picked contact point from selection page")
 
 		if foundPoints[contactPoint] == nil {
-			return nil, fmt.Errorf("not a valid contact point: %s", contactPoint)
+			return nil, b.profile.invalidContactPointError(contactPoint)
 		}
 
 		err := foundPoints[contactPoint].FindContainingButton().TapButton(ctx, b.CurrentPage.Interpreter)
@@ -1666,6 +2395,9 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		whatsAppCode := userInput["whatsapp_code"]
 		if whatsAppCode == "" {
 			instructions := b.getCodeInstructions()
+			if instructions == "" {
+				instructions = b.profile.whatsAppInstruction
+			}
 			if b.LastError != "" {
 				instructions = fmt.Sprintf(
 					"%s. %s", strings.TrimSuffix(b.LastError, "."), instructions,
@@ -1674,9 +2406,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.whatsapp",
+				StepID:       b.stepID("whatsapp"),
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
+					CanCancel: b.MFACanGoBack,
 					Fields: []bridgev2.LoginInputDataField{
 						{ID: "whatsapp_code", Name: "Six-digit code", Type: bridgev2.LoginInputFieldType2FACode},
 					},
@@ -1687,7 +2420,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "whatsapp_code")
-		b.LastError = "Facebook rejected that code"
+		b.LastError = b.rejectedCodeMessage()
 
 		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
@@ -1727,21 +2460,70 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).
 			FindContainingButton()
 		if btn == nil {
-			return nil, ErrLoginMandatoryPasskey
+			return nil, b.profile.errors.MandatoryPasskey
 		}
 		err := btn.TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
 			return nil, fmt.Errorf("tapping try another way button: %w", err)
 		}
 
+	case StateSuggestedAccountPage:
+		// "We couldn't find an account matching the login info you entered, but found an
+		// account that closely matches based on your login history". Identifying details of
+		// the account are shown on screen.
+		//
+		// For now, assume that if Facebook is recommending a specific account and providing
+		// personal information for that account, that they have verified the credentials
+		// sufficiently that we can assume they've picked the right account and we should
+		// just proceed.
+		err = b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+			FindContainingButton().
+			TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping continue: %w", err)
+		}
+
 	default:
 		return nil, fmt.Errorf("unexpected state %s", b.State)
 	}
+	if resetErr := b.passwordResetRequiredError(); resetErr != nil && step == nil {
+		log.Warn().Str("state", string(b.State)).Msg("Instagram requires a password reset before the login can finish")
+		return nil, resetErr
+	}
 	if b.State == prevState {
 		if step != nil {
-			log.Debug().Str("cur_state", string(b.State)).Any("steps", step).Msg("Requested user input")
+			fieldIDs := []string{}
+			fieldOptions := []string{}
+			if step.UserInputParams != nil {
+				for _, field := range step.UserInputParams.Fields {
+					fieldIDs = append(fieldIDs, field.ID)
+					if field.Type == bridgev2.LoginInputFieldTypeSelect {
+						fieldOptions = append(fieldOptions, field.Options...)
+					}
+				}
+			}
+			if step.CookiesParams != nil {
+				for _, field := range step.CookiesParams.Fields {
+					fieldIDs = append(fieldIDs, field.ID)
+				}
+			}
+			log.Debug().
+				Str("cur_state", string(b.State)).
+				Str("step_id", step.StepID).
+				Strs("field_ids", fieldIDs).
+				Strs("field_options", fieldOptions).
+				Msg("Requested user input")
 		} else if b.LastError != "" {
-			log.Debug().Str("cur_state", string(b.State)).Str("last_error", b.LastError).Msg("Got intra-screen error, remaining in current state")
+			log.Debug().
+				Str("cur_state", string(b.State)).
+				Bool("has_last_error", true).
+				Msg("Got intra-screen error, remaining in current state")
+		} else if b.PageTransitionCount > prevPageTransitionCount {
+			// This seems to happen sometimes on the CAA page. If we determine that
+			// login is never successful after that happens, we can make this an error
+			// again.
+			log.Debug().Msg("Redirected explicitly back to same page")
 		} else {
 			return nil, fmt.Errorf("handling %s failed to advance flow", prevState)
 		}
@@ -1754,4 +2536,399 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		b.LastError = ""
 	}
 	return step, nil
+}
+
+func (b *Browser) CancelLoginStep(ctx context.Context) error {
+	if b.State == StateAuthenticationCodePage && b.AuthCodeEntryChosen {
+		b.AuthCodeEntryChosen = false
+		return nil
+	}
+	if !b.MFACanGoBack {
+		return fmt.Errorf("current login step cannot be cancelled")
+	}
+	switch b.State {
+	case StateCodeEntryPage, StateAuthenticationCodePage, StateBackupCodePage, StateTOTPPage,
+		StateSMSPageAfterSend, StateWhatsAppPageAfterSend, StateAFADPageWaiting:
+	default:
+		return fmt.Errorf("current login step cannot be cancelled")
+	}
+	btn := b.CurrentPage.
+		FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).
+		FindContainingButton()
+	if btn == nil {
+		return fmt.Errorf("couldn't find try another way button")
+	}
+	if err := btn.TapButton(ctx, b.CurrentPage.Interpreter); err != nil {
+		return fmt.Errorf("tapping try another way button: %w", err)
+	}
+	b.MFACanGoBack = false
+	return nil
+}
+
+const (
+	authCodeActionFieldID  = "code_action"
+	authCodeActionEnter    = "Enter code"
+	authCodeActionResend   = "Get a new code"
+	authCodeActionAnother  = "Try another way"
+	authCodeResendFailed   = "Instagram didn't confirm that it sent a new code. Check for a message before requesting another"
+	authCodeResendAccepted = "Instagram is sending a new code"
+	authCodeAnotherFailed  = "Instagram didn't offer another way to confirm it's you"
+)
+
+func (b *Browser) handleAuthenticationCodeOptions(
+	ctx context.Context,
+	userInput map[string]string,
+) (step *bridgev2.LoginStep, handled bool, err error) {
+	if b.AuthCodeEntryChosen {
+		return nil, false, nil
+	}
+	findButton := func(label string) *BloksTreeComponent {
+		return b.CurrentPage.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", label)).FindContainingButton()
+	}
+	resend, another := findButton(authCodeActionResend), findButton(authCodeActionAnother)
+	if resend == nil && another == nil {
+		return nil, false, nil
+	}
+	log := zerolog.Ctx(ctx)
+	switch choice := userInput[authCodeActionFieldID]; {
+	case choice == "":
+		options := []string{authCodeActionEnter}
+		if resend != nil {
+			options = append(options, authCodeActionResend)
+		}
+		if another != nil {
+			options = append(options, authCodeActionAnother)
+		}
+		instructions := authenticationCodeInstructions(b.CurrentPage)
+		if instructions == "" {
+			instructions = b.profile.codeInstruction
+		}
+		if b.LastError != "" {
+			instructions = fmt.Sprintf("%s. %s", strings.TrimSuffix(b.LastError, "."), instructions)
+			b.LastError = ""
+		}
+		return &bridgev2.LoginStep{
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       b.stepID(authCodeActionFieldID),
+			Instructions: instructions,
+			UserInputParams: &bridgev2.LoginUserInputParams{
+				Fields: []bridgev2.LoginInputDataField{{
+					ID:           authCodeActionFieldID,
+					Name:         "Verification code",
+					Type:         bridgev2.LoginInputFieldTypeSelect,
+					DefaultValue: authCodeActionEnter,
+					Options:      options,
+				}},
+			},
+		}, true, nil
+	case choice == authCodeActionEnter:
+		delete(userInput, authCodeActionFieldID)
+		b.AuthCodeEntryChosen = true
+		return nil, false, nil
+	case choice == authCodeActionResend && resend != nil:
+		delete(userInput, authCodeActionFieldID)
+		actionRPCCountBefore := b.ActionRPCCount
+		tapErr := resend.TapButton(ctx, b.CurrentPage.Interpreter)
+		if b.State == StateDialog {
+			b.AuthCodeEntryChosen = true
+			return nil, true, nil
+		} else if b.State != StateAuthenticationCodePage {
+			return nil, true, nil
+		}
+		if tapErr != nil || b.ActionRPCCount == actionRPCCountBefore {
+			log.Warn().Err(tapErr).Msg("Instagram resend code request did not complete")
+			b.LastError = authCodeResendFailed
+		} else {
+			b.LastError = authCodeResendAccepted
+		}
+		b.AuthCodeEntryChosen = true
+		return nil, false, nil
+	case choice == authCodeActionAnother && another != nil:
+		delete(userInput, authCodeActionFieldID)
+		b.LastError = authCodeAnotherFailed
+		if err = another.TapButton(ctx, b.CurrentPage.Interpreter); err != nil {
+			return nil, true, fmt.Errorf("tapping try another way button: %w", err)
+		}
+		return nil, true, nil
+	default:
+		return nil, true, errors.New("invalid verification code option")
+	}
+}
+
+func authenticationCodeInstructions(page *BloksBundle) string {
+	if page == nil {
+		return ""
+	}
+	parts := []string{}
+	for _, comp := range page.FindDescendants(FilterByComponent("bk.data.TextSpan")) {
+		text := strings.TrimSpace(comp.GetAttribute("text"))
+		normalized := strings.ToLower(text)
+		switch normalized {
+		case "", "continue", strings.ToLower(authCodeActionEnter), strings.ToLower(authCodeActionResend), strings.ToLower(authCodeActionAnother):
+			continue
+		}
+		if strings.HasPrefix(normalized, "check your ") ||
+			strings.Contains(normalized, "code") ||
+			strings.Contains(normalized, " sent ") {
+			parts = appendUniqueString(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func authenticationConfirmationPageState(page *BloksBundle) BrowserState {
+	if page != nil && page.FindDescendant(FilterByComponent("bk.components.TextInput")) != nil {
+		if input := page.FindDescendant(FilterByAttribute("bk.components.TextInput", "html_name", "password")); input != nil && input.GetAttribute("type") == "password" {
+			return StatePasswordFormPage
+		}
+		inputs := page.FindDescendants(FilterByComponent("bk.components.TextInput"))
+		if len(inputs) == 1 && inputs[0].GetAttribute("type") == "number" &&
+			page.FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Enter code")) != nil {
+			return StateAuthenticationCodePage
+		}
+		return StateAccountRecoveryPage
+	}
+	return StateAuthenticationConfirm
+}
+
+func findAuthenticationConfirmationButton(page *BloksBundle) (*BloksTreeComponent, int) {
+	if page == nil {
+		return nil, 0
+	}
+	var fallback *BloksTreeComponent
+	clickableTextCount := 0
+	for _, comp := range page.FindDescendants(func(comp *BloksTreeComponent) bool {
+		switch comp.ComponentID {
+		case "bk.data.TextSpan", "bk.components.AccessibilityExtension":
+			return true
+		default:
+			return false
+		}
+	}) {
+		text := comp.GetAttribute("text")
+		if text == "" {
+			text = comp.GetAttribute("label")
+		}
+		button := comp.FindContainingButton()
+		if text == "" || button == nil {
+			continue
+		}
+		clickableTextCount++
+		normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+		switch normalized {
+		case "continue":
+			return button, clickableTextCount
+		case "yes, continue", "yes, it's me", "yes, it’s me", "that's me", "that’s me", "this is me", "confirm":
+			if fallback == nil {
+				fallback = button
+			}
+		default:
+			if strings.HasPrefix(normalized, "continue as ") && fallback == nil {
+				fallback = button
+			}
+		}
+	}
+	return fallback, clickableTextCount
+}
+
+func findAccountSelectionOptions(page *BloksBundle) (map[string]*BloksTreeComponent, []string, int) {
+	found := map[string]*BloksTreeComponent{}
+	if page == nil {
+		return found, nil, 0
+	}
+
+	type buttonLabels struct {
+		button        *BloksTreeComponent
+		text          []string
+		accessibility []string
+	}
+	byButton := map[*BloksTreeComponent]*buttonLabels{}
+	buttonOrder := []*BloksTreeComponent{}
+	clickableTextCount := 0
+	for _, comp := range page.FindDescendants(func(comp *BloksTreeComponent) bool {
+		switch comp.ComponentID {
+		case "bk.data.TextSpan", "bk.components.AccessibilityExtension", "accessibilityExtension":
+			return true
+		default:
+			return false
+		}
+	}) {
+		label := comp.GetAttribute("text")
+		if label == "" {
+			label = comp.GetAttribute("label")
+		}
+		label = strings.TrimSpace(label)
+		button := comp.FindContainingButton()
+		if label == "" || button == nil {
+			continue
+		}
+		clickableTextCount++
+		group := byButton[button]
+		if group == nil {
+			group = &buttonLabels{button: button}
+			byButton[button] = group
+			buttonOrder = append(buttonOrder, button)
+		}
+		if comp.ComponentID == "bk.data.TextSpan" {
+			group.text = appendUniqueString(group.text, label)
+		} else {
+			group.accessibility = appendUniqueString(group.accessibility, label)
+		}
+	}
+
+	names := []string{}
+	for _, button := range buttonOrder {
+		group := byButton[button]
+		labels := group.text
+		if len(labels) == 0 {
+			labels = group.accessibility
+		}
+		accountLabels := []string{}
+		for _, label := range labels {
+			if !isAccountSelectionAction(label) {
+				accountLabels = append(accountLabels, label)
+			}
+		}
+		if len(accountLabels) == 0 {
+			continue
+		}
+		name := strings.Join(accountLabels, " · ")
+		uniqueName := name
+		for suffix := 2; found[uniqueName] != nil; suffix++ {
+			uniqueName = fmt.Sprintf("%s (%d)", name, suffix)
+		}
+		found[uniqueName] = group.button
+		names = append(names, uniqueName)
+	}
+	return found, names, clickableTextCount
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func isAccountSelectionAction(label string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(label), " "))
+	switch normalized {
+	case "select an account", "choose an account", "accounts",
+		"continue", "next", "back", "cancel", "remove", "edit",
+		"try another way", "forgot password?", "forgotten password?",
+		"log into another account", "log in to another account",
+		"add account", "add another account", "create new account":
+		return true
+	default:
+		return strings.HasPrefix(normalized, "log in to another account") ||
+			strings.HasPrefix(normalized, "log into another account")
+	}
+}
+
+func findMessengerMFAMethodOptions(
+	page *BloksBundle,
+	log *zerolog.Logger,
+) (map[string]*BloksTreeComponent, []string, int) {
+	if page == nil {
+		return map[string]*BloksTreeComponent{}, nil, 0
+	}
+	return page.FindMFAMethods(log)
+}
+
+func findMFAMethodOptions(page *BloksBundle) (map[string]*BloksTreeComponent, []string, int) {
+	found := map[string]*BloksTreeComponent{}
+	if page == nil {
+		return found, nil, 0
+	}
+	methodNames := []string{}
+	seenButtons := map[*BloksTreeComponent]bool{}
+	unsupportedCount := 0
+	for _, span := range page.FindDescendants(FilterByComponent("bk.data.TextSpan")) {
+		method := strings.TrimSpace(span.GetAttribute("text"))
+		button := span.FindAncestor(func(comp *BloksTreeComponent) bool {
+			for _, prop := range []BloksAttributeID{"on_click", "on_touch_down", "on_touch_up"} {
+				if comp.Attributes[prop] != nil {
+					return true
+				}
+			}
+			return false
+		})
+		if method == "" || button == nil || seenButtons[button] {
+			continue
+		}
+		isMethod, supported := classifyMFAMethod(method)
+		if !isMethod {
+			continue
+		}
+		seenButtons[button] = true
+		if !supported {
+			unsupportedCount++
+			continue
+		}
+		found[method] = span
+		methodNames = append(methodNames, method)
+	}
+	return found, methodNames, unsupportedCount
+}
+
+func (profile browserPlatformProfile) twoStepEntrypointState(page *BloksBundle) BrowserState {
+	if page == nil {
+		return StateMFALandingPage
+	}
+	if page.FindDescendant(FilterByComponent("bk.components.TextInput")) != nil {
+		for _, span := range page.FindDescendants(FilterByComponent("bk.data.TextSpan")) {
+			label := strings.ToLower(strings.Join(strings.Fields(span.GetAttribute("text")), " "))
+			switch {
+			case strings.Contains(label, "authentication app"),
+				strings.Contains(label, "authenticator app"),
+				strings.Contains(label, "six-digit"),
+				strings.Contains(label, "6-digit"):
+				return StateTOTPPage
+			case strings.Contains(label, "backup code"):
+				return StateBackupCodePage
+			case strings.Contains(label, "whatsapp"):
+				return StateWhatsAppPage
+			case strings.Contains(label, "text message"),
+				strings.Contains(label, "sms"):
+				return StateSMSPage
+			}
+		}
+		return StateCodeEntryPage
+	}
+	if profile.hasMFAMethodsOnLanding(page) {
+		return StateChooseMFAPage
+	} else if isPasskeyPrompt(page) {
+		return StatePasskeyPage
+	}
+	return StateMFALandingPage
+}
+
+func isPasskeyPrompt(page *BloksBundle) bool {
+	return page.FindDescendant(func(comp *BloksTreeComponent) bool {
+		return comp.ComponentID == "bk.data.TextSpan" &&
+			strings.Contains(strings.ToLower(comp.GetAttribute("text")), "passkey")
+	}) != nil
+}
+
+func classifyMFAMethod(label string) (isMethod, supported bool) {
+	normalized := strings.ToLower(strings.Join(strings.Fields(label), " "))
+	switch {
+	case strings.Contains(normalized, "google"), strings.Contains(normalized, "passkey"):
+		return true, false
+	case strings.Contains(normalized, "authentication app"),
+		strings.Contains(normalized, "authenticator app"),
+		strings.Contains(normalized, "text message"),
+		strings.Contains(normalized, "sms"),
+		strings.Contains(normalized, "backup code"),
+		strings.Contains(normalized, "whatsapp"),
+		strings.Contains(normalized, "another device"),
+		strings.Contains(normalized, "notification"),
+		normalized == "email",
+		strings.Contains(normalized, "email code"):
+		return true, true
+	default:
+		return false, false
+	}
 }

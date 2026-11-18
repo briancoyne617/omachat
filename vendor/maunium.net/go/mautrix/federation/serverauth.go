@@ -17,10 +17,10 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/util/ptr"
+	"go.mau.fi/util/exsync"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
@@ -32,8 +32,7 @@ type ServerAuth struct {
 	GetDestination func(XMatrixAuth) string
 	MaxBodySize    int64
 
-	keyFetchLocks     map[string]*sync.Mutex
-	keyFetchLocksLock sync.Mutex
+	keyFetchLocks exsync.KeyedMutex[string]
 }
 
 func NewServerAuth(client *Client, keyCache KeyCache, getDestination func(auth XMatrixAuth) string) *ServerAuth {
@@ -42,7 +41,6 @@ func NewServerAuth(client *Client, keyCache KeyCache, getDestination func(auth X
 		Client:         client,
 		GetDestination: getDestination,
 		MaxBodySize:    50 * 1024 * 1024,
-		keyFetchLocks:  make(map[string]*sync.Mutex),
 	}
 }
 
@@ -54,6 +52,7 @@ var (
 	errMalformedAuthHeader     = MUnauthorized.WithMessage("X-Matrix value is missing required components")
 	errInvalidDestination      = MUnauthorized.WithMessage("Invalid destination in X-Matrix header")
 	errFailedToQueryKeys       = MUnauthorized.WithMessage("Failed to query server keys")
+	errMismatchingServerName   = MUnauthorized.WithMessage("Server name in X-Matrix header does not match server name in key query response")
 	errInvalidSelfSignatures   = MUnauthorized.WithMessage("Server keys don't have valid self-signatures")
 	errRequestBodyTooLarge     = mautrix.MTooLarge.WithMessage("Request body too large")
 	errInvalidJSONBody         = mautrix.MBadJSON.WithMessage("Request body is not valid JSON")
@@ -80,8 +79,7 @@ func (xma XMatrixAuth) String() string {
 
 func ParseXMatrixAuth(auth string) (xma XMatrixAuth) {
 	auth = strings.TrimPrefix(auth, "X-Matrix ")
-	// TODO upgrade to strings.SplitSeq after Go 1.24 is the minimum
-	for _, part := range strings.Split(auth, ",") {
+	for part := range strings.SplitSeq(auth, ",") {
 		part = strings.TrimSpace(part)
 		eqIdx := strings.Index(part, "=")
 		if eqIdx == -1 || strings.Count(part, "=") > 1 {
@@ -102,31 +100,26 @@ func ParseXMatrixAuth(auth string) (xma XMatrixAuth) {
 	return
 }
 
-func (sa *ServerAuth) GetKeysWithCache(ctx context.Context, serverName string, keyID id.KeyID) (*ServerKeyResponse, error) {
-	res, err := sa.Keys.LoadKeys(serverName)
+func (sa *ServerAuth) GetKeysWithCache(ctx context.Context, serverName string, keyID id.KeyID, maxBackoff time.Duration) (*ServerKeyResponse, error) {
+	res, err := sa.Keys.LoadKeys(ctx, serverName, maxBackoff)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cache: %w", err)
 	} else if res.HasKey(keyID) {
 		return res, nil
 	}
 
-	sa.keyFetchLocksLock.Lock()
-	lock, ok := sa.keyFetchLocks[serverName]
-	if !ok {
-		lock = &sync.Mutex{}
-		sa.keyFetchLocks[serverName] = lock
-	}
-	sa.keyFetchLocksLock.Unlock()
+	sa.keyFetchLocks.Lock(serverName)
+	defer sa.keyFetchLocks.Unlock(serverName)
 
-	lock.Lock()
-	defer lock.Unlock()
-	res, err = sa.Keys.LoadKeys(serverName)
+	res, err = sa.Keys.LoadKeys(ctx, serverName, maxBackoff)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cache: %w", err)
 	} else if res != nil {
 		if res.HasKey(keyID) {
 			return res, nil
-		} else if !sa.Keys.ShouldReQuery(serverName) {
+		} else if ok, err := sa.Keys.ShouldReQuery(ctx, serverName); err != nil {
+			return nil, fmt.Errorf("failed to check if should re-query keys: %w", err)
+		} else if !ok {
 			zerolog.Ctx(ctx).Trace().
 				Str("server_name", serverName).
 				Stringer("key_id", keyID).
@@ -136,10 +129,20 @@ func (sa *ServerAuth) GetKeysWithCache(ctx context.Context, serverName string, k
 	}
 	res, err = sa.Client.ServerKeys(ctx, serverName)
 	if err != nil {
-		sa.Keys.StoreFetchError(serverName, err)
+		storeErr := sa.Keys.StoreFetchError(ctx, serverName, err)
+		if storeErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(storeErr).
+				Str("server_name", serverName).
+				Msg("Failed to store server key fetch error in cache")
+		}
 		return nil, err
 	}
-	sa.Keys.StoreKeys(res)
+	err = sa.Keys.StoreKeys(ctx, res)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Str("server_name", serverName).
+			Msg("Failed to store server keys in cache")
+	}
 	return res, nil
 }
 
@@ -160,6 +163,10 @@ func (l *fixedLimitedReader) Read(p []byte) (n int, err error) {
 	l.N -= int64(n)
 	return
 }
+
+const (
+	requestAuthResolutionMaxBackoff = 5 * time.Minute
+)
 
 func (sa *ServerAuth) Authenticate(r *http.Request) (*http.Request, *mautrix.RespError) {
 	defer func() {
@@ -188,7 +195,7 @@ func (sa *ServerAuth) Authenticate(r *http.Request) (*http.Request, *mautrix.Res
 			Msg("Invalid destination in X-Matrix header")
 		return nil, &errInvalidDestination
 	}
-	resp, err := sa.GetKeysWithCache(r.Context(), parsed.Origin, parsed.KeyID)
+	resp, err := sa.GetKeysWithCache(r.Context(), parsed.Origin, parsed.KeyID, requestAuthResolutionMaxBackoff)
 	if err != nil {
 		if !errors.Is(err, ErrRecentKeyQueryFailed) {
 			log.Err(err).
@@ -199,8 +206,11 @@ func (sa *ServerAuth) Authenticate(r *http.Request) (*http.Request, *mautrix.Res
 				Str("server_name", parsed.Origin).
 				Msg("Failed to query keys to authenticate request (cached error)")
 		}
+		if errors.Is(err, ErrMismatchingServerName) {
+			return nil, &errMismatchingServerName
+		}
 		return nil, &errFailedToQueryKeys
-	} else if err := resp.VerifySelfSignature(); err != nil {
+	} else if err = resp.VerifySelfSignature(); err != nil {
 		log.Trace().Err(err).
 			Str("server_name", parsed.Origin).
 			Msg("Failed to validate self-signatures of server keys")
@@ -213,7 +223,7 @@ func (sa *ServerAuth) Authenticate(r *http.Request) (*http.Request, *mautrix.Res
 			Stringer("expected_key_id", parsed.KeyID).
 			Any("found_key_ids", keys).
 			Msg("Didn't find expected key ID to verify request")
-		return nil, ptr.Ptr(MUnauthorized.WithMessage("Key ID %q not found (got %v)", parsed.KeyID, keys))
+		return nil, new(MUnauthorized.WithMessage("Key ID %q not found (got %v)", parsed.KeyID, keys))
 	}
 	var reqBody []byte
 	if r.ContentLength != 0 && r.Method != http.MethodGet && r.Method != http.MethodHead {

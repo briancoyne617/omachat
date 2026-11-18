@@ -20,7 +20,7 @@ func TestIgnoreStatusUpdatesFromLiveAndHistory(t *testing.T) {
 	live := &events.Message{
 		Info: types.MessageInfo{
 			MessageSource: types.MessageSource{Chat: statusJID, Sender: types.NewJID("15551234567", types.DefaultUserServer)},
-			ID:            "status-live", IsNewsletterStatus: true,
+			ID:            "status-live", StanzaTag: "status",
 		},
 		Message: story,
 	}
@@ -51,7 +51,7 @@ func TestStatusUpdateDetection(t *testing.T) {
 		want bool
 	}{
 		{"status JID", types.MessageInfo{MessageSource: types.MessageSource{Chat: types.StatusBroadcastJID}}, true},
-		{"status metadata", types.MessageInfo{IsNewsletterStatus: true}, true},
+		{"status metadata", types.MessageInfo{StanzaTag: "status"}, true},
 		{"regular chat", types.MessageInfo{MessageSource: types.MessageSource{Chat: types.NewJID("15551234567", types.DefaultUserServer)}}, false},
 		{"ordinary broadcast list", types.MessageInfo{MessageSource: types.MessageSource{Chat: types.NewJID("123456789", types.BroadcastServer)}}, false},
 	}

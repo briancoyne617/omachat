@@ -10,17 +10,29 @@ const (
 )
 
 var InstagramEndpoints = map[string]string{
-	"host":            instaWWWHost,
-	"base_url":        instaBaseUrl, //+ "/",
-	"messages":        instaBaseUrl + "/direct/inbox/",
-	"thread":          instaBaseUrl + "/direct/t/",
-	"graphql":         instaBaseUrl + "/api/graphql",
-	"cookie_consent":  "https://graphql.instagram.com/graphql/",
-	"default_graphql": "https://graphql.instagram.com/graphql/",
+	"host":                        instaWWWHost,
+	"base_url":                    instaBaseUrl, //+ "/",
+	"messages":                    instaBaseUrl + "/direct/inbox/",
+	"login":                       instaBaseUrl + "/accounts/login/",
+	"login_ajax":                  instaWebApiV1Url + "/accounts/login/ajax/",
+	"login_two_factor":            instaBaseUrl + "/accounts/login/two_factor/",
+	"login_two_factor_ajax":       instaWebApiV1Url + "/accounts/login/ajax/two_factor/",
+	"login_two_factor_sms":        instaWebApiV1Url + "/accounts/send_two_factor_login_sms/",
+	"login_two_step_verification": instaBaseUrl + "/accounts/login/two_step_verification/",
+	"fxcal_sso_users":             instaWebApiV1Url + "/fxcal/ig_sso_users/",
+	"fxcal_sso_login":             instaWebApiV1Url + "/fxcal/ig_sso_login/",
+	"thread":                      instaBaseUrl + "/direct/t/",
+	"graphql":                     instaBaseUrl + "/api/graphql",
+	"cookie_consent":              "https://graphql.instagram.com/graphql/",
+	"default_graphql":             "https://graphql.instagram.com/graphql/",
 
 	"dgw_lightspeed":       instaDGWBase + "/ws/lightspeed",
 	"dgw_mqttbypass":       instaDGWBase + "/ws/mqttbypass",
 	"dgw_streamcontroller": instaDGWBase + "/ws/streamcontroller",
+
+	"dgw_lightspeed_native":       instaDGWBase + "/lightspeed",
+	"dgw_mqttbypass_native":       instaDGWBase + "/mqttbypass",
+	"dgw_streamcontroller_native": instaDGWBase + "/streamcontroller",
 
 	"e2ee_ws_url":   "wss://web-chat-e2ee.instagram.com/ws/chat",
 	"icdc_fetch":    "https://reg-e2ee.instagram.com/v2/fb_icdc_fetch",
@@ -35,7 +47,7 @@ var InstagramEndpoints = map[string]string{
 	"bulk_route_definition": instaBaseUrl + "/ajax/bulk-route-definitions/",
 
 	"web_profile_info": instaApiV1Url + "/users/web_profile_info/?",
-	"reels_media":      instaApiV1Url + "/feed/reels_media/?",
+	"reels_media":      instaApiV1Url + "/feed/reels_media/",
 	"media_info":       instaApiV1Url + "/media/%s/info/",
 	"web_push":         instaWebApiV1Url + "/push/register/",
 }

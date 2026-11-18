@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/tidwall/sjson"
@@ -30,8 +32,10 @@ import (
 type Ghost struct {
 	*database.Ghost
 	Bridge *Bridge
-	Log    zerolog.Logger
 	Intent MatrixAPI
+
+	syncLock sync.Mutex
+	lastSync time.Time
 }
 
 func (br *Bridge) loadGhost(ctx context.Context, dbGhost *database.Ghost, queryErr error, id *networkid.UserID) (*Ghost, error) {
@@ -54,7 +58,6 @@ func (br *Bridge) loadGhost(ctx context.Context, dbGhost *database.Ghost, queryE
 	ghost := &Ghost{
 		Ghost:  dbGhost,
 		Bridge: br,
-		Log:    br.Log.With().Str("ghost_id", string(dbGhost.ID)).Logger(),
 		Intent: br.Matrix.GhostIntent(dbGhost.ID),
 	}
 	br.ghostsByID[ghost.ID] = ghost
@@ -332,6 +335,8 @@ func (ghost *Ghost) updateDMPortals(ctx context.Context) {
 }
 
 func (ghost *Ghost) UpdateInfo(ctx context.Context, info *UserInfo) {
+	ghost.syncLock.Lock()
+	defer ghost.syncLock.Unlock()
 	oldName := ghost.Name
 	oldAvatar := ghost.AvatarMXC
 
@@ -402,5 +407,43 @@ func (ghost *Ghost) pushProfileChanges(ctx context.Context, nameChanged, avatarC
 				ghost.ContactInfoSet = true
 			}
 		}
+	}
+	ghost.lastSync = time.Now()
+}
+
+func (ghost *Ghost) reconcileProfile(ctx context.Context, current *event.MemberEventContent, updatedProfile *UserInfo) {
+	if !ghost.syncLock.TryLock() {
+		return
+	}
+	defer ghost.syncLock.Unlock()
+	// Re-set the profile on the server if:
+	// * the bridge database thinks the profile field is set
+	// * the member event has a different value than the bridge database
+	// * the value isn't being updated right after this call
+	nameDrift := ghost.NameSet && ghost.Name != "" && current.Displayname != ghost.Name &&
+		(updatedProfile == nil || updatedProfile.Name == nil || *updatedProfile.Name == ghost.Name)
+	avatarDrift := ghost.AvatarSet && ghost.AvatarMXC != "" && current.AvatarURL != ghost.AvatarMXC &&
+		(updatedProfile == nil || updatedProfile.Avatar == nil || updatedProfile.Avatar.ID == ghost.AvatarID)
+	// Also don't allow re-setting too often, because there might be multiple in-flight room syncs
+	// that all call this method in a short period.
+	if (!nameDrift && !avatarDrift) || time.Since(ghost.lastSync) < 5*time.Minute {
+		return
+	}
+	zerolog.Ctx(ctx).Warn().
+		Str("ghost_id", string(ghost.ID)).
+		Bool("name_drift", nameDrift).
+		Bool("avatar_drift", avatarDrift).
+		Str("expected_name", ghost.Name).
+		Str("actual_name", current.Displayname).
+		Msg("Ghost profile drifted from the server copy, re-pushing")
+	if nameDrift {
+		ghost.NameSet = false
+	}
+	if avatarDrift {
+		ghost.AvatarSet = false
+	}
+	ghost.pushProfileChanges(ctx, nameDrift, avatarDrift, false)
+	if err := ghost.Bridge.DB.Ghost.Update(ctx, ghost.Ghost); err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to save ghost after profile reconcile")
 	}
 }

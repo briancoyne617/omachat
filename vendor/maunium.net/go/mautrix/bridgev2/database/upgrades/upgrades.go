@@ -15,4 +15,7 @@ import (
 //go:embed *.sql
 var rawUpgrades embed.FS
 
-var Table = dbutil.BuildUpgradeTable().WithFS(rawUpgrades).Finish()
+var Table = dbutil.BuildUpgradeTable().
+	WithFS(rawUpgrades).
+	With(upgradeV30).
+	Finish()

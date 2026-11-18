@@ -187,8 +187,8 @@ func (int *DangerousInternalClient) GetUnifiedSessionID() string {
 	return int.c.getUnifiedSessionID()
 }
 
-func (int *DangerousInternalClient) SendUnifiedSession() {
-	int.c.sendUnifiedSession()
+func (int *DangerousInternalClient) SendUnifiedSession(checkLastSend bool) {
+	int.c.sendUnifiedSession(checkLastSend)
 }
 
 func (int *DangerousInternalClient) HandleStreamError(ctx context.Context, node *waBinary.Node) {
@@ -303,6 +303,10 @@ func (int *DangerousInternalClient) SendKeepAlive(ctx context.Context) (isSucces
 	return int.c.sendKeepAlive(ctx)
 }
 
+func (int *DangerousInternalClient) IsKeepAliveNode(node *waBinary.Node) bool {
+	return int.c.isKeepAliveNode(node)
+}
+
 func (int *DangerousInternalClient) RefreshMediaConn(ctx context.Context, force bool) (*MediaConn, error) {
 	return int.c.refreshMediaConn(ctx, force)
 }
@@ -317,10 +321,6 @@ func (int *DangerousInternalClient) HandleMediaRetryNotification(ctx context.Con
 
 func (int *DangerousInternalClient) HandleEncryptedMessage(ctx context.Context, node *waBinary.Node) {
 	int.c.handleEncryptedMessage(ctx, node)
-}
-
-func (int *DangerousInternalClient) HandleUnencryptedMessage(ctx context.Context, node *waBinary.Node) {
-	int.c.handleUnencryptedMessage(ctx, node)
 }
 
 func (int *DangerousInternalClient) ParseMessageSource(node *waBinary.Node, requireParticipant bool) (source types.MessageSource, err error) {
@@ -419,6 +419,10 @@ func (int *DangerousInternalClient) HandleDecryptedMessage(ctx context.Context, 
 	return int.c.handleDecryptedMessage(ctx, info, msg, retryCount)
 }
 
+func (int *DangerousInternalClient) EncryptWASAMessage(ctx context.Context, bot types.JID, id types.MessageID, msg *waE2E.Message) ([]byte, error) {
+	return int.c.encryptWASAMessage(ctx, bot, id, msg)
+}
+
 func (int *DangerousInternalClient) DecryptMsgSecret(ctx context.Context, msg *events.Message, useCase MsgSecretType, encrypted messageEncryptedSecret, origMsgKey *waCommon.MessageKey) ([]byte, error) {
 	return int.c.decryptMsgSecret(ctx, msg, useCase, encrypted, origMsgKey)
 }
@@ -443,8 +447,8 @@ func (int *DangerousInternalClient) HandleEncryptNotification(ctx context.Contex
 	int.c.handleEncryptNotification(ctx, node)
 }
 
-func (int *DangerousInternalClient) HandleAppStateNotification(ctx context.Context, node *waBinary.Node) {
-	int.c.handleAppStateNotification(ctx, node)
+func (int *DangerousInternalClient) HandleAppStateNotification(ctx context.Context, node *waBinary.Node) bool {
+	return int.c.handleAppStateNotification(ctx, node)
 }
 
 func (int *DangerousInternalClient) HandlePictureNotification(ctx context.Context, node *waBinary.Node) {
@@ -453,6 +457,10 @@ func (int *DangerousInternalClient) HandlePictureNotification(ctx context.Contex
 
 func (int *DangerousInternalClient) HandleDeviceNotification(ctx context.Context, node *waBinary.Node) {
 	int.c.handleDeviceNotification(ctx, node)
+}
+
+func (int *DangerousInternalClient) HandleFBCallNotification(ctx context.Context, node *waBinary.Node) bool {
+	return int.c.handleFBCallNotification(ctx, node)
 }
 
 func (int *DangerousInternalClient) HandleFBDeviceNotification(ctx context.Context, node *waBinary.Node) {
@@ -509,6 +517,10 @@ func (int *DangerousInternalClient) HandleIQ(ctx context.Context, node *waBinary
 
 func (int *DangerousInternalClient) HandlePairDevice(ctx context.Context, node *waBinary.Node) {
 	int.c.handlePairDevice(ctx, node)
+}
+
+func (int *DangerousInternalClient) RotateADVSecret(ctx context.Context) {
+	int.c.rotateADVSecret(ctx)
 }
 
 func (int *DangerousInternalClient) GetQRClientType() PairClientType {
@@ -835,6 +847,6 @@ func (int *DangerousInternalClient) Usync(ctx context.Context, jids []types.JID,
 	return int.c.usync(ctx, jids, mode, context, query, extra...)
 }
 
-func (int *DangerousInternalClient) ParseBlocklist(node *waBinary.Node) *types.Blocklist {
+func (int *DangerousInternalClient) ParseBlocklist(node *waBinary.Node) (*types.Blocklist, []store.LIDMapping) {
 	return int.c.parseBlocklist(node)
 }

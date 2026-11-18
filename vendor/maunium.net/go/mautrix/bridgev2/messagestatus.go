@@ -65,25 +65,36 @@ type MessageStatus struct {
 	InternalError error  // Internal error to be tracked in message checkpoints
 	Message       string // Human-readable message shown to users
 
+	DisappearingTimer *event.BeeperDisappearingTimer
+
 	ErrorAsMessage bool
 	IsCertain      bool
 	SendNotice     bool
 	DisableMSS     bool
 }
 
+type HumanError interface {
+	error
+	HumanError() string
+}
+
 func WrapErrorInStatus(err error) MessageStatus {
 	var alreadyWrapped MessageStatus
 	var ok bool
+	var msg string
 	if alreadyWrapped, ok = err.(MessageStatus); ok {
 		return alreadyWrapped
 	} else if errors.As(err, &alreadyWrapped) {
 		alreadyWrapped.InternalError = err
 		return alreadyWrapped
+	} else if he, ok := errors.AsType[HumanError](err); ok {
+		msg = he.HumanError()
 	}
 	return MessageStatus{
 		Status:        event.MessageStatusRetriable,
 		ErrorReason:   event.MessageStatusGenericError,
 		InternalError: err,
+		Message:       msg,
 	}
 }
 
@@ -201,6 +212,9 @@ func (ms *MessageStatus) ToMSSEvent(evt *MessageStatusEventInfo) *event.BeeperMe
 	}
 	if ms.DeliveredTo != nil {
 		content.DeliveredToUsers = &ms.DeliveredTo
+	}
+	if ms.Status == event.MessageStatusSuccess {
+		content.DisappearingTimer = ms.DisappearingTimer
 	}
 	return content
 }
