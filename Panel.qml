@@ -115,7 +115,7 @@ Panel {
     function onPaired(network) { root.rememberConversation(network, "") }
   }
   readonly property var serviceTabs: unifiedInboxEnabled
-    ? [{value:"all", label:"All", icon:"󰭹", tooltip:"All services", unread:0}].concat(providerTabs)
+    ? [{value:"all", label:"People", icon:"󰭹", tooltip:"People across all services", unread:0}].concat(providerTabs)
     : providerTabs
   readonly property var unifiedConversations: Keybindings.buildUnifiedConversations(
     providerTabs.map(function(tab) {
@@ -1655,7 +1655,7 @@ Panel {
       keepPreviousEmojiSearchText: root.keepPreviousEmojiSearchText
       sidebarCollapsed: root.sidebarCollapsed
       viewActive: unifiedInboxLoader.visible
-      conversations: root.unifiedConversations.map(function(row) {
+      conversations: root.unifiedConversations.filter(Model.isKnownConversation).map(function(row) {
         var copy = Object.assign({}, row)
         var tab = root.allServiceTabs.find(function(candidate) { return candidate.value === row.network })
         copy.networkLabel = tab ? tab.label : row.network

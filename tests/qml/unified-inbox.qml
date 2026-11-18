@@ -14,6 +14,16 @@ ShellRoot {
     for (var i=0; i<fake.requests.length; i++) if (fake.requests[i].method === method) return fake.requests.splice(i,1)[0]
     throw new Error("missing " + method)
   }
+  function visualChild(item, name) {
+    if (!item) return null
+    if (item.objectName === name) return item
+    var children = item.children || []
+    for (var i = 0; i < children.length; i++) {
+      var found = visualChild(children[i], name)
+      if (found) return found
+    }
+    return null
+  }
   function row(net) { return unified.conversations.find(function(c) { return c.network === net }) }
   QtObject { id: drafts; property var drafts: ({}) }
   QtObject {
@@ -98,6 +108,19 @@ ShellRoot {
           break
         case 6:
           root.stale()
+          fake.conversations=[{id:"k",name:"Known",known:true,unread:true,kind:"rcs",timestamp:3},{id:"o",name:"Other",known:false,unread:true,kind:"sms",timestamp:2},{id:"p",name:"Plain",known:false,kind:"sms",timestamp:1}]
+          check(provider.segmented && provider.segment==="contacts" && provider.visibleConversations.length===1 && provider.visibleConversations[0].id==="k", "Google list defaults to the Contacts segment")
+          check(inspect.findChild(provider,"conversationSegments")!==null && provider.unreadConversations===1, "segment toggle is present and counts unread per segment")
+          provider.segment="others"
+          check(provider.visibleConversations.length===2 && provider.unreadConversations===1, "Others segment lists unknown threads")
+          provider.selectConversation("k",false)
+          check(provider.segment==="contacts", "opening a known thread reveals its segment")
+          take("messages").callback(true,{messages:[],hasMore:false})
+          var mark=visualChild(unified,"unifiedServiceMark")
+          check(mark!==null && mark.width>0 && (mark.network==="whatsapp" || mark.network==="gmessages"), "unified rows render a service mark")
+          check(visualChild(unified,"unifiedServiceBadge")===null, "text service badge is gone from unified rows")
+          break
+        case 7:
           console.log("OMACHAT_UNIFIED_INBOX_PASS")
           Qt.callLater(Qt.quit)
           return

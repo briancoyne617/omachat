@@ -425,3 +425,22 @@ function receiptLabel(msg) {
   if (s === "sent") return "Sent"
   return "Sent"
 }
+
+// A conversation is "known" when the person is a saved contact, or a Google
+// Messages number the user has replied to. Helpers that predate the field send
+// nothing, and then every conversation counts as known.
+function isKnownConversation(conv) {
+  return !!conv && conv.known !== false
+}
+
+// Splits a conversation list into the Contacts and Others segments.
+function conversationsInSegment(list, segment) {
+  var wantKnown = segment !== "others"
+  return (list || []).filter(function(conv) { return isKnownConversation(conv) === wantKnown })
+}
+
+function unreadCount(list) {
+  var n = 0
+  for (var i = 0; i < (list || []).length; i++) if (list[i].unread === true) n++
+  return n
+}

@@ -127,7 +127,7 @@ Item {
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.top: parent.top
-      text: "ALL INBOXES"
+      text: "PEOPLE"
       color: Model.readableInk(Commons.Color.popups.background, Commons.Color.muted)
       foreground: root.foreground
       fontFamily: root.fontFamily
@@ -193,7 +193,7 @@ Item {
       model: root.visibleConversations
       activeFocusOnTab: true
       Accessible.role: Accessible.List
-      Accessible.name: "All service conversations"
+      Accessible.name: "People across all services"
       Keys.onReturnPressed: root.openFocusedConversation()
       Keys.onEnterPressed: root.openFocusedConversation()
 
@@ -223,10 +223,23 @@ Item {
           }
         }
 
+        // The service (and, for Google Messages, SMS vs RCS) the chat travels over.
+        ServiceMark {
+          id: serviceMark
+          objectName: "unifiedServiceMark"
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          network: convItem.modelData.network || ""
+          kind: convItem.modelData.kind || ""
+          color: root.foreground
+          fontFamily: root.fontFamily
+        }
+
         Avatar {
           id: convAvatar
           objectName: "unifiedSelectedAvatar"
-          anchors.left: parent.left
+          anchors.left: serviceMark.right
           anchors.leftMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
           implicitWidth: Style.space(32)
@@ -239,26 +252,11 @@ Item {
         }
 
         Text {
-          id: serviceBadge
-          objectName: "unifiedServiceBadge"
-          textFormat: Text.PlainText
-          anchors.right: parent.right
-          anchors.rightMargin: Style.space(8)
-          anchors.top: parent.top
-          anchors.topMargin: Style.space(6)
-          text: convItem.modelData.networkLabel || convItem.modelData.network
-          color: root.foreground
-          elide: Text.ElideRight
-          font.family: root.fontFamily
-          font.pixelSize: root.fs(Style.font.caption)
-        }
-
-        Text {
           textFormat: Text.PlainText
           anchors.left: convAvatar.right
           anchors.leftMargin: Style.space(8)
-          anchors.right: serviceBadge.left
-          anchors.rightMargin: Style.space(6)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
           anchors.top: parent.top
           anchors.topMargin: Style.space(7)
           text: convItem.modelData.name || "(no name)"

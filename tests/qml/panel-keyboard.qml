@@ -139,7 +139,7 @@ ShellRoot {
         check(panel.activeService==="signal","Ctrl+2 selects Signal when it is the second enabled tab")
         fake.enabledServices=["gmessages","whatsapp","telegram"]
         panel.unifiedInboxEnabled=true
-        check(panel.serviceTabs[0].value==="all" && panel.serviceTabs[0].label==="All","unified inbox appears as the first labeled tab when enabled")
+        check(panel.serviceTabs[0].value==="all" && panel.serviceTabs[0].label==="People","unified inbox appears as the first labeled tab when enabled")
         panel.activeService="gmessages"
         keyboard.keyClick(Qt.Key_1,Qt.ControlModifier,0)
         check(panel.activeService==="all","Ctrl+1 selects the unified inbox when enabled")
@@ -167,7 +167,7 @@ ShellRoot {
         var unifiedRight=inspect.findChild(unifiedLoader.item,"unifiedDetailPane")
         check(unifiedRight.width>0 && unifiedLeft.width>0 && unifiedRight.x>unifiedLeft.x,"unified inbox keeps its list and thread panes side by side")
         check(root.visualChild(unifiedLoader.item,"unifiedSelectedAvatar")!==null,"unified list renders the selected contact avatar")
-        check(root.visualChild(unifiedLoader.item,"unifiedServiceBadge")!==null,"unified list tags each conversation with its service")
+        check(root.visualChild(unifiedLoader.item,"unifiedServiceMark")!==null,"unified list marks each conversation with its service")
         var sidebarToggle=inspect.findChild(panel,"sidebarToggleButton")
         check(sidebarToggle.visible && sidebarToggle.enabled,"conversation-list visibility control is available in the unified inbox")
         var expandedDetailWidth=unifiedRight.width

@@ -191,23 +191,28 @@ Item {
     return null
   }
 
+  // Google Messages lists every thread from the phone, so it is split into
+  // people (saved contacts, or numbers you have replied to) and everything else.
+  readonly property bool segmented: network === "gmessages" && !detailOnly
+  property string segment: "contacts"
+  readonly property var contactConversations: Model.conversationsInSegment(conversations, "contacts")
+  readonly property var otherConversations: Model.conversationsInSegment(conversations, "others")
+  readonly property var listedConversations: !segmented ? conversations
+    : (segment === "others" ? otherConversations : contactConversations)
+
   readonly property var visibleConversations: {
     var q = searchQuery.trim().toLowerCase()
-    if (q === "") return conversations
+    if (q === "") return listedConversations
     var out = []
-    for (var i = 0; i < conversations.length; i++) {
-      var c = conversations[i]
+    for (var i = 0; i < listedConversations.length; i++) {
+      var c = listedConversations[i]
       if ((c.name || "").toLowerCase().indexOf(q) >= 0
           || (c.preview || "").toLowerCase().indexOf(q) >= 0) out.push(c)
     }
     return out
   }
 
-  readonly property int unreadConversations: {
-    var n = 0
-    for (var i = 0; i < conversations.length; i++) if (conversations[i].unread === true) n++
-    return n
-  }
+  readonly property int unreadConversations: Model.unreadCount(listedConversations)
 
   readonly property var visibleNewChatTargets: {
     var query = newChatSearch ? newChatSearch.text.trim().toLowerCase() : ""
@@ -555,6 +560,11 @@ Item {
 
   function selectConversation(id, remember) {
     if (sendingMedia) return
+    if (segmented) {
+      // Opening a thread from a notification or another view reveals its segment.
+      var target = conversations.find(function(conv) { return conv.id === id })
+      if (target) segment = Model.isKnownConversation(target) ? "contacts" : "others"
+    }
     if (id === selectedConvID) { focusComposer(); return }
     var saved = Object.assign({}, _draftsByNet)
     if (selectedConvID) {
@@ -1530,12 +1540,69 @@ Item {
       onClicked: root.openNewChat()
     }
 
+    // Contacts / Others toggle for Google Messages.
+    Rectangle {
+      id: segmentBar
+      objectName: "conversationSegments"
+      visible: root.segmented
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: searchField.bottom
+      anchors.topMargin: Style.space(6)
+      height: visible ? Style.space(28) : 0
+      radius: Style.space(6)
+      color: "transparent"
+      border.width: 1
+      border.color: Style.normalFillFor(root.foreground, Commons.Color.accent)
+      clip: true
+
+      Row {
+        anchors.fill: parent
+        Repeater {
+          model: [
+            { value: "contacts", label: "Contacts", unread: Model.unreadCount(root.contactConversations) },
+            { value: "others", label: "Others", unread: Model.unreadCount(root.otherConversations) }
+          ]
+          delegate: Rectangle {
+            id: segmentItem
+            required property var modelData
+            readonly property bool current: root.segment === modelData.value
+            objectName: "segment-" + modelData.value
+            width: segmentBar.width / 2
+            height: segmentBar.height
+            color: current ? Style.normalFillFor(root.foreground, Commons.Color.accent)
+              : (segmentMouse.containsMouse ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent")
+            Accessible.role: Accessible.RadioButton
+            Accessible.name: modelData.label + (modelData.unread > 0 ? ", " + modelData.unread + " unread" : "")
+            Accessible.checked: current
+            Accessible.onPressAction: root.segment = modelData.value
+            MouseArea {
+              id: segmentMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.segment = segmentItem.modelData.value
+            }
+            Text {
+              textFormat: Text.PlainText
+              anchors.centerIn: parent
+              text: segmentItem.modelData.label + (segmentItem.modelData.unread > 0 ? " (" + segmentItem.modelData.unread + ")" : "")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: fs(Style.font.caption)
+              font.bold: segmentItem.current || segmentItem.modelData.unread > 0
+            }
+          }
+        }
+      }
+    }
+
     Rectangle {
       id: unreadChip
       visible: root.unreadConversations > 0
       anchors.left: parent.left
       anchors.right: parent.right
-      anchors.top: searchField.bottom
+      anchors.top: segmentBar.visible ? segmentBar.bottom : searchField.bottom
       anchors.topMargin: Style.space(6)
       height: visible ? Style.space(28) : 0
       radius: Style.space(6)
@@ -1590,7 +1657,7 @@ Item {
       Keys.onEnterPressed: root.openFocusedConversation()
       anchors.left: parent.left
       anchors.right: parent.right
-      anchors.top: unreadChip.visible ? unreadChip.bottom : searchField.bottom
+      anchors.top: unreadChip.visible ? unreadChip.bottom : (segmentBar.visible ? segmentBar.bottom : searchField.bottom)
       anchors.bottom: parent.bottom
       anchors.topMargin: Style.space(8)
       clip: true

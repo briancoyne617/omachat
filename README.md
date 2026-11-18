@@ -224,9 +224,12 @@ conversations across active services, and each service tab shows its own unread
 badge while the app is open.
 
 The optional **Unified inbox** in **Settings > Inbox** combines conversations
-from enabled services in the **All** tab. It defaults off. **Ctrl+Shift+A**
-toggles the preference; the All list keeps each conversation's service badge,
-message routing, and draft separate. Its connection badge summarizes enabled
+from enabled services in the **People** tab. It defaults off. **Ctrl+Shift+A**
+toggles the preference; People lists only known conversations (saved contacts,
+and Google Messages numbers you have replied to) and marks each with a small
+service glyph, or an SMS pill for plain texts. Message routing and drafts stay
+separate per service. In the Google Messages tab, **Contacts** and **Others**
+segments separate people from unsaved senders and short-code businesses. Its connection badge summarizes enabled
 services, including a connected-service count when only some are online.
 Hide or show its sidebar with the same
 header control as an individual inbox. Disabling a service removes its rows.

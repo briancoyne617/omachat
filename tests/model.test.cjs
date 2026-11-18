@@ -86,3 +86,11 @@ test('thread and conversation models keep the newest records within a budget', (
   assert.equal(model.boundConversations(convs).length, model.MAX_CONVERSATIONS);
   assert.equal(model.boundConversations(convs)[0].id, '0');
 });
+
+test('known conversations split into Contacts and Others, and older helpers show everything', () => {
+  const rows = [{ id: 'a', known: true, unread: true }, { id: 'b', known: false, unread: true }, { id: 'c', known: false }, { id: 'd' }];
+  assert.deepEqual(plain(model.conversationsInSegment(rows, 'contacts').map(c => c.id)), ['a', 'd']);
+  assert.deepEqual(plain(model.conversationsInSegment(rows, 'others').map(c => c.id)), ['b', 'c']);
+  assert.equal(model.isKnownConversation(null), false);
+  assert.equal(model.unreadCount(model.conversationsInSegment(rows, 'others')), 1);
+});
