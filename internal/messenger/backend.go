@@ -63,7 +63,13 @@ func fbMessageRestricted(evt *events.FBMessage) bool {
 		ephemeralSettingRestricted(metadata.GetEphemeralSettingList().GetEphemeralSetting())
 }
 
-const encryptedHistoryNotice = "Older messages in this end-to-end encrypted conversation are not currently supported. New messages will appear while OmaChat is connected."
+// encryptedHistoryNotice is shown for an encrypted chat until its history is
+// restored with the Messenger PIN. New messages appear while OmaChat is
+// connected either way.
+const encryptedHistoryNotice = "Older messages in this end-to-end encrypted conversation are not shown yet. Restore them with your Messenger PIN in Settings. New messages will appear while OmaChat is connected."
+
+// encryptedNoBackupNotice replaces it when the account has no encrypted backup.
+const encryptedNoBackupNotice = "Older messages in this end-to-end encrypted conversation are not available: this Messenger account has no encrypted chat backup. New messages will appear while OmaChat is connected."
 
 type sessionData struct {
 	Cookies map[string]string `json:"cookies"`
@@ -99,6 +105,22 @@ type Backend struct {
 	avatarPending  map[string]bool
 	runCtx         context.Context
 	cancel         context.CancelFunc
+
+	// Encrypted history restore; see history.go. histMu guards the fields
+	// below it and is never held across a call to Meta. Lock order: histMu
+	// may take mu, never the reverse.
+	histMu        sync.Mutex
+	hist          historyFile
+	histLoaded    bool
+	backfilling   bool
+	restoreBusy   bool
+	backupChecked bool
+	backfillDone  chan struct{}
+	cutovers      map[int64]cutoverLink // guarded by mu
+	// Seams for tests; nil means the real client.
+	newHistory   func(*messagix.Client) historyService
+	threadLister func(context.Context) error
+	openFetcher  func(ctx context.Context, openThread int64, oldest *wireMessageRef) error
 }
 
 func New(log zerolog.Logger, paths *appStore.Paths, publish func(wire.Event)) *Backend {
@@ -117,6 +139,7 @@ func New(log zerolog.Logger, paths *appStore.Paths, publish func(wire.Event)) *B
 		threadAvatars:  make(map[int64]string),
 		avatarCache:    make(map[string]string),
 		avatarPending:  make(map[string]bool),
+		cutovers:       make(map[int64]cutoverLink),
 	}
 }
 
@@ -253,6 +276,7 @@ func (b *Backend) connect(ctx context.Context, mc *cookies.Cookies) error {
 		b.mu.Lock()
 		b.mergeStoredMessengerDataLocked(loadStoredMessengerData(b.paths.MessengerStoreFile()))
 		b.mu.Unlock()
+		b.initHistoryStatus()
 	}
 	cli := messagix.NewClient(mc, b.log.With().Str("component", "meta").Logger(), &messagix.Config{})
 	connected := false
@@ -375,6 +399,14 @@ func (b *Backend) Stop() {
 }
 func (b *Backend) Unpair(context.Context) error {
 	b.Stop()
+	// Forget the backup device and every restore cursor with the session.
+	b.histMu.Lock()
+	b.hist, b.histLoaded, b.backupChecked = historyFile{}, false, false
+	b.histMu.Unlock()
+	b.mu.Lock()
+	b.status.HistoryRestore = nil
+	b.cutovers = make(map[int64]cutoverLink)
+	b.mu.Unlock()
 	b.setState(wire.StateUnpaired, "")
 	return b.paths.ClearMessengerSession()
 }
@@ -431,6 +463,13 @@ func (b *Backend) handleTableUpdates(tbl *table.LSTable, live bool) {
 		for _, msg := range b.setContactNameLocked(contact.Id, contact.Name) {
 			queue(msg)
 		}
+	}
+	if len(tbl.LSCreateOpenToE2EEThreadLink) > 0 {
+		links := make([]cutoverLinkRow, 0, len(tbl.LSCreateOpenToE2EEThreadLink))
+		for _, link := range tbl.LSCreateOpenToE2EEThreadLink {
+			links = append(links, cutoverLinkRow{armadilloThread: link.ArmadilloThreadID, openThread: link.OpenThreadID, show: link.ShowOpenMessageHistory})
+		}
+		b.recordCutoverLinksLocked(links)
 	}
 	for _, m := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
 		b.setMappingLocked(m.ThreadKey, m.ThreadJID, table.ENCRYPTED_OVER_WA_ONE_TO_ONE)
@@ -1195,6 +1234,9 @@ func (b *Backend) Messages(ctx context.Context, p wire.MessagesParams) (wire.Mes
 	cli := b.client
 	threadType := b.threadTypes[thread]
 	b.mu.RUnlock()
+	if threadType.IsWhatsApp() && b.confirmedDevice() != nil {
+		return b.encryptedMessages(ctx, thread, p)
+	}
 	if cli != nil && !threadType.IsWhatsApp() {
 		resp, fetchErr := cli.ExecuteTasks(ctx, &socket.FetchMessagesTask{ThreadKey: thread, Direction: 0, ReferenceTimestampMs: p.CursorTime, ReferenceMessageId: p.CursorID, SyncGroup: 1})
 		if fetchErr != nil {
@@ -1212,6 +1254,10 @@ func (b *Backend) Messages(ctx context.Context, p wire.MessagesParams) (wire.Mes
 	result := wire.MessagesResult{ConversationID: p.ConversationID, Messages: list}
 	if threadType.IsWhatsApp() {
 		result.HistoryNotice = encryptedHistoryNotice
+		if b.currentHistoryRestore().State == wire.HistoryNoBackup {
+			result.HistoryNotice = encryptedNoBackupNotice
+		}
+		result.HistoryRestorable = b.encryptedHistoryRestorable()
 	}
 	return result, nil
 }
@@ -1237,11 +1283,14 @@ func (b *Backend) Send(ctx context.Context, p wire.SendParams) (*wire.Message, e
 			return nil, errors.New("Messenger encrypted transport is not connected")
 		}
 		content := &waConsumerApplication.ConsumerApplication{Payload: &waConsumerApplication.ConsumerApplication_Payload{Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{Content: &waConsumerApplication.ConsumerApplication_Content{Content: &waConsumerApplication.ConsumerApplication_Content_MessageText{MessageText: &waCommon.MessageText{Text: proto.String(text)}}}}}}
-		resp, e := e2ee.SendFBMessage(ctx, jid, content, nil, whatsmeow.SendRequestExtra{ID: id})
+		// SendFBMessage fills in the franking key the history upload needs.
+		meta := &waMsgApplication.MessageApplication_Metadata{}
+		resp, e := e2ee.SendFBMessage(ctx, jid, content, meta, whatsmeow.SendRequestExtra{ID: id})
 		if e != nil {
 			return nil, e
 		}
 		ts = resp.Timestamp
+		b.uploadSentMessageToHistory(jid, id, content, meta)
 	} else {
 		otid := methods.GenerateEpochID()
 		resp, e := cli.ExecuteTasks(ctx, &socket.SendMessageTask{ThreadId: thread, Otid: otid, Source: table.MESSENGER_INBOX, SendType: table.TEXT, SyncGroup: 1, Text: text, InitiatingSource: table.FACEBOOK_INBOX})

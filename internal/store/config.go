@@ -32,6 +32,11 @@ type Config struct {
 	UnifiedInboxEnabled         bool              `json:"unifiedInboxEnabled,omitempty"`
 	KeepPreviousEmojiSearchText bool              `json:"keepPreviousEmojiSearchText,omitempty"`
 	WhatsAppHistoryCacheMB      int               `json:"whatsappHistoryCacheMB,omitempty"`
+	// MessengerSecureHistoryUpload uploads the encrypted copy of each message
+	// sent from here to the account's Messenger secure-storage backup, as the
+	// mautrix-meta e2ee_backfill option does. Off unless set: no sent message
+	// leaves this desktop for the backup by default.
+	MessengerSecureHistoryUpload bool `json:"messengerSecureHistoryUpload,omitempty"`
 
 	// UiScale multiplies panel type. 1 is the theme default. 0 means unset
 	// and is treated as 1 when read.
@@ -399,6 +404,15 @@ func (c *ConfigStore) SetWhatsAppHistoryCacheMB(size int) error {
 	return c.updateLocked(func(cfg map[string]any, loaded *Config) {
 		cfg["whatsappHistoryCacheMB"] = size
 		loaded.WhatsAppHistoryCacheMB = size
+	})
+}
+
+// SetMessengerSecureHistoryUpload persists whether sent Messenger messages are
+// uploaded to the account's encrypted backup.
+func (c *ConfigStore) SetMessengerSecureHistoryUpload(enabled bool) error {
+	return c.updateLocked(func(cfg map[string]any, loaded *Config) {
+		cfg["messengerSecureHistoryUpload"] = enabled
+		loaded.MessengerSecureHistoryUpload = enabled
 	})
 }
 

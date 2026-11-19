@@ -132,6 +132,15 @@ const (
 	MethodAvatar                    = "avatar"
 	MethodRefresh                   = "refresh"
 	MethodSetTelegramCredentials    = "setTelegramCredentials"
+	// MethodMessengerRestoreHistory restores end-to-end encrypted Messenger
+	// history with the account's secure-storage PIN. It is a Messenger method.
+	MethodMessengerRestoreHistory = "messengerRestoreHistory"
+	// MethodMessengerHistoryStatus reports whether the account has an
+	// encrypted backup, without using the PIN.
+	MethodMessengerHistoryStatus = "messengerHistoryStatus"
+	// MethodSetMessengerSecureHistoryUpload turns uploading of sent messages to
+	// the encrypted backup on or off. It is a global setting.
+	MethodSetMessengerSecureHistoryUpload = "setMessengerSecureHistoryUpload"
 )
 
 // ConnState describes where the daemon is in its lifecycle. The plugin keys
@@ -173,6 +182,54 @@ type Status struct {
 	// BoundedRead advertises markRead with ThroughTimestamp. Old helpers must
 	// not be assumed to enforce an unknown optional field.
 	BoundedRead bool `json:"boundedRead,omitempty"`
+	// HistoryRestore is set only for Messenger: the state of encrypted chat
+	// history restore. It never carries the PIN or provider error text.
+	HistoryRestore *HistoryRestore `json:"historyRestore,omitempty"`
+}
+
+// HistoryRestore states. Unknown is the empty string and is omitted.
+const (
+	// HistoryNoBackup: the account has no Messenger secure-storage backup.
+	HistoryNoBackup = "none"
+	// HistoryAvailable: a backup exists and has not been restored here.
+	HistoryAvailable = "available"
+	// HistoryRestoring: the device is enrolled and chats are being fetched.
+	HistoryRestoring = "restoring"
+	// HistoryRestored: history was restored; older pages load on demand.
+	HistoryRestored = "restored"
+	// HistoryWrongPIN: Meta rejected the PIN; AttemptsRemaining may be set.
+	HistoryWrongPIN = "wrongPin"
+	// HistoryPINLocked: Meta reports no attempts remaining. The PIN must be
+	// reset in the Messenger app before history can be restored.
+	HistoryPINLocked = "pinLocked"
+	// HistoryUnconfirmed: enrollment started but Meta never confirmed it.
+	HistoryUnconfirmed = "unconfirmed"
+	// HistoryFailed: restore stopped for another reason; Text says what to do.
+	HistoryFailed = "failed"
+)
+
+// HistoryRestore is the progress and outcome of an encrypted history restore.
+type HistoryRestore struct {
+	State string `json:"state,omitempty"`
+	// Text is a fixed, human-readable sentence written by the helper.
+	Text string `json:"text,omitempty"`
+	// Done and Total count chats while State is restoring or restored.
+	Done  int `json:"done,omitempty"`
+	Total int `json:"total,omitempty"`
+	// AttemptsRemaining is what Meta reports after a wrong PIN.
+	AttemptsRemaining *int `json:"attemptsRemaining,omitempty"`
+	// Enrolled reports that this desktop holds a confirmed backup device.
+	Enrolled bool `json:"enrolled,omitempty"`
+}
+
+// MessengerRestoreHistoryParams carries the PIN. The helper never logs or
+// stores it and clears its copy as soon as Meta has answered.
+type MessengerRestoreHistoryParams struct {
+	PIN string `json:"pin"`
+}
+
+type SetMessengerSecureHistoryUploadParams struct {
+	Enabled bool `json:"enabled"`
 }
 
 // Conversation is a flattened gmproto.Conversation, carrying only what the
@@ -385,6 +442,9 @@ type MessagesResult struct {
 	HistoryNotice     string    `json:"historyNotice,omitempty"`
 	CanFetchOlder     bool      `json:"canFetchOlder,omitempty"`
 	HistoryFetchState string    `json:"historyFetchState,omitempty"`
+	// HistoryRestorable is set for an end-to-end encrypted Messenger chat
+	// whose older history can be restored with the account's PIN.
+	HistoryRestorable bool `json:"historyRestorable,omitempty"`
 }
 
 type HistoryUpdate struct {
@@ -524,6 +584,9 @@ type ConfigResult struct {
 	KeepPreviousEmojiSearchText bool              `json:"keepPreviousEmojiSearchText"`
 	UnifiedInboxEnabled         bool              `json:"unifiedInboxEnabled"`
 	WhatsAppHistoryCacheMB      int               `json:"whatsappHistoryCacheMB"`
+	// MessengerSecureHistoryUpload reports whether sent encrypted Messenger
+	// messages are also uploaded to the account's encrypted backup.
+	MessengerSecureHistoryUpload bool `json:"messengerSecureHistoryUpload"`
 }
 
 type SetEnabledServicesParams struct {

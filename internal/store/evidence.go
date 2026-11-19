@@ -13,6 +13,7 @@ func (p *Paths) HasAccountEvidence() bool {
 		p.MessengerSessionFile(),
 		p.MessengerDBFile(),
 		p.MessengerStoreFile(),
+		p.MessengerHistoryFile(),
 	}
 	for _, f := range files {
 		if _, err := os.Stat(f); !os.IsNotExist(err) {

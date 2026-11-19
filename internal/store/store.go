@@ -273,6 +273,13 @@ func (p *Paths) MessengerMediaDir() string { return filepath.Join(p.Cache, "medi
 // MessengerStoreFile holds the local cache of Messenger conversations and messages.
 func (p *Paths) MessengerStoreFile() string { return filepath.Join(p.Data, "messenger_store.json") }
 
+// MessengerHistoryFile holds the Messenger secure-storage backup device keys
+// and per-chat restore cursors. It is private (0600) and is removed with the
+// rest of the Messenger session. The PIN is never written anywhere.
+func (p *Paths) MessengerHistoryFile() string {
+	return filepath.Join(p.Data, "messenger_history.json")
+}
+
 // ClearMessengerSession removes stored Messenger credentials/database, conversation cache, and media caches.
 func (p *Paths) ClearMessengerSession() error {
 	p.sessionMu.Lock()
@@ -287,6 +294,9 @@ func (p *Paths) ClearMessengerSession() error {
 		}
 	}
 	if err := os.Remove(p.MessengerStoreFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(p.MessengerHistoryFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := os.RemoveAll(p.MessengerMediaDir()); err != nil {

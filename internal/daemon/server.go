@@ -548,6 +548,30 @@ func (d *Daemon) dispatchMessenger(ctx context.Context, req wire.Request) wire.R
 			return fail(err)
 		}
 		return ok(nil)
+	case wire.MethodMessengerHistoryStatus:
+		res, err := d.fb.HistoryStatus(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		return ok(res)
+	case wire.MethodMessengerRestoreHistory:
+		p, err := decodeParams[wire.MessengerRestoreHistoryParams](req.Params)
+		// The PIN is a password. Drop the decoded copies as soon as possible;
+		// the backend clears the byte slice once Meta has answered.
+		if params, isMap := req.Params.(map[string]any); isMap {
+			delete(params, "pin")
+		}
+		pin := []byte(p.PIN)
+		p.PIN = ""
+		if err != nil {
+			clear(pin)
+			return fail(errors.New("invalid restore request"))
+		}
+		res, err := d.fb.RestoreHistory(ctx, pin)
+		if err != nil {
+			return fail(err)
+		}
+		return ok(res)
 	case wire.MethodListProfiles:
 		return ok(d.ListProfiles())
 	case wire.MethodSetProfile:
@@ -816,6 +840,16 @@ func (d *Daemon) dispatchGMessages(ctx context.Context, req wire.Request) wire.R
 			return fail(err)
 		}
 		if err := d.SetKeepPreviousEmojiSearchText(p.KeepPreviousEmojiSearchText); err != nil {
+			return fail(err)
+		}
+		return ok(d.PluginConfig())
+
+	case wire.MethodSetMessengerSecureHistoryUpload:
+		p, err := decodeParams[wire.SetMessengerSecureHistoryUploadParams](req.Params)
+		if err != nil {
+			return fail(err)
+		}
+		if err := d.SetMessengerSecureHistoryUpload(p.Enabled); err != nil {
 			return fail(err)
 		}
 		return ok(d.PluginConfig())

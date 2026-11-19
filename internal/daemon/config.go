@@ -34,6 +34,8 @@ func (d *Daemon) PluginConfig() wire.ConfigResult {
 		KeepPreviousEmojiSearchText: cfg.KeepPreviousEmojiSearchText,
 		UnifiedInboxEnabled:         cfg.UnifiedInboxEnabled,
 		WhatsAppHistoryCacheMB:      cfg.WhatsAppHistoryCacheMB,
+
+		MessengerSecureHistoryUpload: cfg.MessengerSecureHistoryUpload,
 	}
 }
 
@@ -55,6 +57,10 @@ func (d *Daemon) SetKeepPreviousEmojiSearchText(keep bool) error {
 
 func (d *Daemon) SetUnifiedInboxEnabled(enabled bool) error {
 	return d.config.SetUnifiedInboxEnabled(enabled)
+}
+
+func (d *Daemon) SetMessengerSecureHistoryUpload(enabled bool) error {
+	return d.config.SetMessengerSecureHistoryUpload(enabled)
 }
 
 func (d *Daemon) SetWhatsAppHistoryCacheMB(size int) error {

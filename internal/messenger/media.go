@@ -28,6 +28,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	"go.mau.fi/whatsmeow/proto/waMediaTransport"
+	"go.mau.fi/whatsmeow/proto/waMsgApplication"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -39,6 +40,9 @@ const (
 
 type messengerMedia struct {
 	key, remoteURL, name, mime, path string
+	// objectID is the encrypted attachment's ID, which an archive page uses
+	// to name the attachment's current CDN path.
+	objectID                         string
 	size, width, height              int64
 	isImage, isGIF, isAudio, isVideo bool
 	fbTransport                      *waMediaTransport.WAMediaTransport_Integral
@@ -134,7 +138,7 @@ func mediaFromFB(t *waMediaTransport.WAMediaTransport, mt whatsmeow.MediaType, i
 	if t == nil || t.GetIntegral() == nil {
 		return nil
 	}
-	m := &messengerMedia{name: name, mime: t.GetAncillary().GetMimetype(), size: int64(t.GetAncillary().GetFileLength()), isImage: image, isGIF: gif, isAudio: audio, isVideo: video, fbTransport: t.GetIntegral(), fbType: mt}
+	m := &messengerMedia{name: name, mime: t.GetAncillary().GetMimetype(), objectID: t.GetAncillary().GetObjectID(), size: int64(t.GetAncillary().GetFileLength()), isImage: image, isGIF: gif, isAudio: audio, isVideo: video, fbTransport: t.GetIntegral(), fbType: mt}
 	if gif {
 		m.isImage = true
 	}
@@ -376,11 +380,13 @@ func (b *Backend) SendMedia(ctx context.Context, p wire.SendMediaParams) (wire.S
 			content = &waConsumerApplication.ConsumerApplication_Content_DocumentMessage{DocumentMessage: dm}
 		}
 		payload := &waConsumerApplication.ConsumerApplication{Payload: &waConsumerApplication.ConsumerApplication_Payload{Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{Content: &waConsumerApplication.ConsumerApplication_Content{Content: content}}}}
-		resp, e := e2ee.SendFBMessage(ctx, jid, payload, nil, whatsmeow.SendRequestExtra{ID: id})
+		meta := &waMsgApplication.MessageApplication_Metadata{}
+		resp, e := e2ee.SendFBMessage(ctx, jid, payload, meta, whatsmeow.SendRequestExtra{ID: id})
 		if e != nil {
 			return wire.SendMediaResult{}, e
 		}
 		ts = resp.Timestamp
+		b.uploadSentMessageToHistory(jid, id, payload, meta)
 		if !isImage && caption != "" {
 			captionMessage, e = b.Send(ctx, wire.SendParams{ConversationID: p.ConversationID, Text: caption})
 			if e != nil {

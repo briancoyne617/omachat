@@ -13,6 +13,7 @@ require (
 	go.mau.fi/whatsmeow v0.0.0-20261116172437-19d61352436f
 	golang.org/x/crypto v0.59.0
 	golang.org/x/image v0.48.0
+	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -77,7 +78,6 @@ require (
 	golang.org/x/mod v0.43.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/tools v0.52.1-0.20261106145633-d407941a339a // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
