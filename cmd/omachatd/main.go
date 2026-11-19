@@ -36,6 +36,14 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "messenger-restore" {
+		if err := runMessengerRestore(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	flag.Parse()
 
 	if *showVersion {
