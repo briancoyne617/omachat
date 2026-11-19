@@ -73,6 +73,13 @@ Flickable {
   property string emojiSearchPreferenceStatusText: ""
   property var keyboardShortcuts: ({})
   property bool unifiedInboxEnabled: false
+  // Messenger encrypted history restore (secure-storage PIN).
+  property var messengerHistory: ({})
+  property string messengerPinDraft: ""
+  property bool restoringMessengerHistory: false
+  property bool messengerHistoryUpload: false
+  property bool savingMessengerHistoryUpload: false
+  property string messengerHistoryError: ""
   property bool savingUnifiedInboxPreference: false
   property string unifiedInboxPreferenceStatusText: ""
 
@@ -113,7 +120,61 @@ Flickable {
       root.popoutMode = res.popoutMode === "tiled" ? "tiled" : "floating"
       root.keyboardShortcuts = res.keyboardShortcuts || ({})
       root.unifiedInboxEnabled = res.unifiedInboxEnabled === true
+      root.messengerHistoryUpload = res.messengerSecureHistoryUpload === true
     }, "gmessages")
+    refreshMessengerHistory()
+  }
+
+  function refreshMessengerHistory() {
+    if (!service || service.connected === false) return
+    var target = service
+    service.call("messengerHistoryStatus", null, function(ok, res) {
+      if (root.service !== target) return
+      if (ok && res) root.messengerHistory = res
+    }, "messenger")
+  }
+
+  function restoreMessengerHistory() {
+    if (!service || service.connected === false || restoringMessengerHistory) return
+    var pin = messengerPinDraft
+    if (!/^[0-9]{6}$/.test(pin) && !(messengerHistory && messengerHistory.enrolled)) {
+      messengerHistoryError = "Enter your 6-digit Messenger PIN."
+      return
+    }
+    var target = service
+    restoringMessengerHistory = true
+    messengerHistoryError = ""
+    // Drop every copy of the PIN in the UI before the request is answered.
+    messengerPinDraft = ""
+    messengerPinField.text = ""
+    service.call("messengerRestoreHistory", {pin: pin}, function(ok, res) {
+      if (root.service !== target) return
+      root.restoringMessengerHistory = false
+      if (!ok) {
+        root.messengerHistoryError = (res && res.error) ? String(res.error) : "Restore failed. Try again."
+        return
+      }
+      if (res) root.messengerHistory = res
+    }, "messenger")
+    pin = ""
+  }
+
+  function saveMessengerHistoryUpload(enabled) {
+    if (!service || service.connected === false || savingMessengerHistoryUpload) return
+    var target = service
+    savingMessengerHistoryUpload = true
+    service.call("setMessengerSecureHistoryUpload", {enabled: enabled === true}, function(ok, res) {
+      if (root.service !== target) return
+      root.savingMessengerHistoryUpload = false
+      if (ok && res) root.messengerHistoryUpload = res.messengerSecureHistoryUpload === true
+    }, "gmessages")
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.visible && root.messengerHistory && root.messengerHistory.state === "restoring"
+    onTriggered: root.refreshMessengerHistory()
   }
 
   function saveUnifiedInboxPreference(enabled) {
@@ -967,6 +1028,133 @@ Flickable {
           font.family: root.fontFamily
           font.pixelSize: fs(Style.font.body)
           lineHeight: 1.25
+        }
+      }
+    }
+
+    Rectangle {
+      width: parent.width
+      height: 1
+      color: Commons.Color.popups.border
+    }
+
+    // Messenger encrypted history (secure-storage PIN)
+    Column {
+      id: messengerHistorySection
+      objectName: "messengerHistorySection"
+      width: parent.width
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        wrapMode: Text.Wrap
+        text: "Messenger encrypted history"
+        color: root.copyColor
+        font.family: root.fontFamily
+        font.pixelSize: fs(Style.font.heading)
+        font.bold: true
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        wrapMode: Text.Wrap
+        text: "Older messages in end-to-end encrypted Messenger chats are kept in Messenger's encrypted backup. Enter the 6-digit PIN you set in Messenger (Settings > Privacy & safety > End-to-end encrypted chats > Message storage) to restore them here. OmaChat checks the PIN with Meta once per attempt, never stores it, and registers this desktop as a history device on your account."
+        color: root.mutedColor
+        font.family: root.fontFamily
+        font.pixelSize: fs(Style.font.body)
+        lineHeight: 1.25
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        objectName: "messengerHistoryStatus"
+        width: parent.width
+        wrapMode: Text.Wrap
+        visible: text !== ""
+        text: {
+          var h = root.messengerHistory || {}
+          var t = h.text || ""
+          if (h.total > 0 && (h.state === "restoring" || h.state === "restored")) t += (t ? " " : "") + "(" + (h.done || 0) + " of " + h.total + " chats)"
+          if (h.attemptsRemaining !== undefined && h.attemptsRemaining !== null) t += (t ? " " : "") + h.attemptsRemaining + " attempt" + (h.attemptsRemaining === 1 ? "" : "s") + " left."
+          return t
+        }
+        color: (root.messengerHistory && root.messengerHistory.state === "failed") ? root.urgentColor : root.copyColor
+        font.family: root.fontFamily
+        font.pixelSize: fs(Style.font.body)
+      }
+
+      SafePasswordField {
+        id: messengerPinField
+        objectName: "messengerPinField"
+        visible: !(root.messengerHistory && root.messengerHistory.enrolled)
+        width: Math.min(parent.width, Style.space(220))
+        maximumLength: 6
+        pasteAllowed: !root.restoringMessengerHistory
+        placeholderText: "6-digit Messenger PIN"
+        placeholderTextColor: root.mutedColor
+        font.pixelSize: fs(Style.font.body)
+        foreground: root.foreground
+        onTextChanged: root.messengerPinDraft = text
+        onAccepted: root.restoreMessengerHistory()
+      }
+
+      Button {
+        focusable: true
+        Accessible.role: Accessible.Button
+        Accessible.name: text
+        objectName: "restoreMessengerHistoryBtn"
+        text: root.restoringMessengerHistory ? "Checking PIN..."
+          : (root.messengerHistory && root.messengerHistory.enrolled) ? "Restore again" : "Restore encrypted history"
+        bordered: true
+        enabled: !root.restoringMessengerHistory && !(root.messengerHistory && root.messengerHistory.state === "restoring")
+          && ((root.messengerHistory && root.messengerHistory.enrolled) || root.messengerPinDraft.length === 6)
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.restoreMessengerHistory()
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        wrapMode: Text.Wrap
+        visible: root.messengerHistoryError !== ""
+        text: root.messengerHistoryError
+        color: root.urgentColor
+        font.family: root.fontFamily
+        font.pixelSize: fs(Style.font.body)
+      }
+
+      Item {
+        width: parent.width
+        height: Math.max(uploadLabel.implicitHeight, uploadToggle.implicitHeight)
+
+        Text {
+          id: uploadLabel
+          textFormat: Text.PlainText
+          anchors.left: parent.left
+          anchors.right: uploadToggle.left
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          wrapMode: Text.Wrap
+          text: "Back up messages sent from OmaChat to Messenger's encrypted storage (off: they stay out of the backup, like an unsynced device)"
+          color: root.copyColor
+          font.family: root.fontFamily
+          font.pixelSize: fs(Style.font.bodySmall)
+        }
+
+        ToggleSwitch {
+          id: uploadToggle
+          objectName: "messengerHistoryUploadToggle"
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.messengerHistoryUpload
+          busy: root.savingMessengerHistoryUpload
+          interactive: true
+          foreground: root.foreground
+          accent: root.accentColor
+          onToggled: root.saveMessengerHistoryUpload(!root.messengerHistoryUpload)
         }
       }
     }
